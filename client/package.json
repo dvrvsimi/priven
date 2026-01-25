@@ -1,0 +1,29 @@
+{
+  "name": "priven-sdk",
+  "version": "0.1.0",
+  "description": "Privacy-preserving pool queries on Solana using MPC",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "prepublish": "npm run build"
+  },
+  "keywords": [
+    "solana",
+    "arcium",
+    "privacy",
+    "quicknode"
+  ],
+  "author": "dvrvsimi",
+  "license": "MIT",
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/web3.js": "^1.98.4",
+    "@arcium-hq/client": "0.6.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@types/node": "^24.0.0"
+  }
+}

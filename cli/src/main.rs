@@ -44,11 +44,11 @@ async fn main() -> Result<()> {
             max_tvl,
             program_id,
         } => {
-            println!("🔐 Priven - Private Query Protocol");
+            println!("Priven - Private Query Protocol");
             println!("RPC: {}", rpc_url);
             println!("Query: TVL between {} and {}", min_tvl, max_tvl);
             println!("Program: {}", program_id);
-            println!("\n⚠️  Implementation coming soon...");
+            println!("\nImplementation coming soon...");
 
             // TODO: Implement query submission
             // 1. Fetch pools from QuickNode

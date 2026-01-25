@@ -1,28 +1,77 @@
-# Priven
+# Priven - Private Pool Queries on Solana
 
-**Privacy-preserving RPC Layer for Solana**
+**Privacy-Preserving DeFi Queries Using Multi-Party Computation**
 
-Priven provides verifiable, privacy-preserving read and simulation access to Solana state by decoupling user identity from query semantics.
+Priven enables private queries of Raydium liquidity pools without revealing your search criteria to anyone—not even the MPC nodes computing your results.
 
 ## Features
 
-- 🔒 **Private Reads** - Query accounts without revealing intent to the RPC
-- ✅ **Verifiable Responses** - Merkle proofs ensure data integrity
-- ⚡ **Low Latency** - Minimal overhead (<50ms) over standard RPC calls
-- wincode for deserialization
+- **Private Search Criteria** - Your predicate (TVL range, filters) never visible to anyone
+- **Verifiable Results** - BLS signatures ensure computation integrity
+- **QuickNode Integration** - Fast, reliable Solana data access
+- **MPC Privacy** - Arcium's threshold computation keeps secrets distributed
 
 ## Architecture
 
 ```
-Client SDK → Private RPC Proxy → QuickNode RPC
-     ↑              |
-     └── Proof ────←┘
+CLIENT
+  1. Fetch pools from QuickNode
+  2. Encrypt predicate (min_tvl, max_tvl)
+  3. Submit query to Solana
+         |
+         v
+MXE PROGRAM (On-chain)
+  1. Read pool account data
+  2. Queue computation with encrypted predicate
+         |
+         v
+ARCIUM MPC CLUSTER
+  1. Secret-share predicate (no node sees plaintext)
+  2. Evaluate: tvl >= min && tvl <= max
+  3. Encrypt results to user's key
+         |
+         v
+CLIENT
+  1. Retrieve encrypted result
+  2. Decrypt locally
+  3. See matching pool addresses
 ```
 
-1. Client generates a **commitment** (hash) of the query
-2. Proxy validates commitment and forwards to QuickNode
-3. Response includes **Merkle proof** of account state
-4. Client **verifies** the proof locally
+## QuickNode Integration
+
+Priven demonstrates meaningful use of QuickNode RPC for privacy-preserving DeFi:
+
+### Core RPC Methods Used
+
+**1. getProgramAccounts** - Fetch all Raydium V4 pools
+```typescript
+const pools = await connection.getProgramAccounts(RAYDIUM_V4_PROGRAM, {
+  filters: [{ dataSize: 752 }], // V4 pool size
+  commitment: "confirmed",
+});
+```
+
+**2. getMultipleAccounts** - Batch fetch selected pool data
+```typescript
+const accounts = await connection.getMultipleAccountsInfo(
+  poolAddresses,
+  "confirmed"
+);
+```
+
+**3. getAccountInfo** - Retrieve MXE encryption keys
+```typescript
+const mxePublicKey = await getMXEPublicKey(connection, programId);
+```
+
+### Privacy Model
+
+- **QuickNode sees:** Generic pool data requests (public anyway)
+- **MPC nodes see:** Secret shares of your search criteria (never reconstructed)
+- **Network sees:** An encrypted query transaction
+- **Only you see:** Which pools match your criteria
+
+This demonstrates how public data sources (QuickNode) can be combined with private computation (Arcium MPC) to enable privacy-preserving DeFi applications.
 
 ## Quick Start
 

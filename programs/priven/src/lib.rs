@@ -13,7 +13,7 @@ const COMP_DEF_OFFSET_EVALUATE_PREDICATE: u32 = comp_def_offset("evaluate_predic
 // Maximum pools per query (must match circuit constant)
 pub const MAX_POOLS: usize = 5;
 
-declare_id!("2YKa6YyAqaSopPC24YsgwWgNzb3RoswmAdTEJtZ9Axy4");
+declare_id!("BDcL3jAuBxfNGuWiDD37AETQfLUgc1hXn8gkb1fCDqaJ");
 
 #[arcium_program]
 pub mod priven {
@@ -105,7 +105,8 @@ pub mod priven {
         let query_result = &mut ctx.accounts.query_result;
         query_result.user = ctx.accounts.payer.key();
         query_result.computation_offset = computation_offset;
-        query_result.encrypted_result = Vec::new();
+        query_result.encrypted_result = [0u8; 240];
+        query_result.encrypted_result_len = 0;
         query_result.result_slot = 0;
         query_result.success = false;
         query_result.bump = ctx.bumps.query_result;
@@ -137,15 +138,28 @@ pub mod priven {
         // Store encrypted result
         let query_result = &mut ctx.accounts.query_result;
 
-        // Serialize the encrypted result
-        let mut encrypted_bytes = Vec::new();
-        encrypted_bytes.extend_from_slice(&result.encryption_key);
-        encrypted_bytes.extend_from_slice(&result.nonce.to_le_bytes());
+        // Serialize the encrypted result into fixed-size array
+        let mut encrypted_result = [0u8; 240];
+        let mut offset = 0;
+
+        // Encryption key (32 bytes)
+        encrypted_result[offset..offset+32].copy_from_slice(&result.encryption_key);
+        offset += 32;
+
+        // Nonce (16 bytes)
+        encrypted_result[offset..offset+16].copy_from_slice(&result.nonce.to_le_bytes());
+        offset += 16;
+
+        // Ciphertexts (variable length, up to 192 bytes for 6 blocks)
         for ciphertext in result.ciphertexts.iter() {
-            encrypted_bytes.extend_from_slice(ciphertext);
+            if offset + 32 <= 240 {
+                encrypted_result[offset..offset+32].copy_from_slice(ciphertext);
+                offset += 32;
+            }
         }
 
-        query_result.encrypted_result = encrypted_bytes;
+        query_result.encrypted_result = encrypted_result;
+        query_result.encrypted_result_len = offset as u16;
         query_result.result_slot = Clock::get()?.slot;
         query_result.success = true;
 
@@ -186,7 +200,7 @@ pub struct SubmitQuery<'info> {
     #[account(
         address = derive_mxe_pda!()
     )]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
 
     #[account(
         init,
@@ -197,9 +211,9 @@ pub struct SubmitQuery<'info> {
             &computation_offset.to_le_bytes(),
         ],
         bump,
-        space = 8 + QueryResultAccount::INIT_SPACE,
+        space = QueryResultAccount::SPACE,
     )]
-    pub query_result: Account<'info, QueryResultAccount>,
+    pub query_result: Box<Account<'info, QueryResultAccount>>,
 
     #[account(
         mut,
@@ -225,25 +239,25 @@ pub struct SubmitQuery<'info> {
     #[account(
         address = derive_comp_def_pda!(COMP_DEF_OFFSET_EVALUATE_PREDICATE)
     )]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
 
     #[account(
         mut,
         address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet)
     )]
-    pub cluster_account: Account<'info, Cluster>,
+    pub cluster_account: Box<Account<'info, Cluster>>,
 
     #[account(
         mut,
         address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS,
     )]
-    pub pool_account: Account<'info, FeePool>,
+    pub pool_account: Box<Account<'info, FeePool>>,
 
     #[account(
         mut,
         address = ARCIUM_CLOCK_ACCOUNT_ADDRESS
     )]
-    pub clock_account: Account<'info, ClockAccount>,
+    pub clock_account: Box<Account<'info, ClockAccount>>,
 
     pub system_program: Program<'info, System>,
     pub arcium_program: Program<'info, Arcium>,
@@ -259,12 +273,12 @@ pub struct EvaluatePredicateCallback<'info> {
     #[account(
         address = derive_comp_def_pda!(COMP_DEF_OFFSET_EVALUATE_PREDICATE)
     )]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
 
     #[account(
         address = derive_mxe_pda!()
     )]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
 
     /// CHECK: computation_account, checked by arcium program via constraints in the callback context.
     pub computation_account: UncheckedAccount<'info>,
@@ -272,7 +286,7 @@ pub struct EvaluatePredicateCallback<'info> {
     #[account(
         address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet)
     )]
-    pub cluster_account: Account<'info, Cluster>,
+    pub cluster_account: Box<Account<'info, Cluster>>,
 
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     /// CHECK: instructions_sysvar, checked by the account constraint
@@ -280,7 +294,7 @@ pub struct EvaluatePredicateCallback<'info> {
 
     // Custom callback accounts
     #[account(mut)]
-    pub query_result: Account<'info, QueryResultAccount>,
+    pub query_result: Box<Account<'info, QueryResultAccount>>,
 }
 
 #[init_computation_definition_accounts("evaluate_predicate", payer)]

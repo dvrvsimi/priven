@@ -15,12 +15,13 @@ mod circuits {
     // =========================================================================
 
     /// Pool data structure - simplified for MVP (just TVL components)
-    /// In production, this would match the exact Raydium AMM pool layout
+    /// Must be 64 bytes (multiple of 32) for account data alignment
     #[derive(Clone, Copy)]
     pub struct PoolData {
-        pub address: [u8; 32],      // Pool pubkey
-        pub token_a_reserve: u64,   // Reserve of token A
-        pub token_b_reserve: u64,   // Reserve of token B
+        pub address: [u8; 32],      // Pool pubkey - 32 bytes
+        pub token_a_reserve: u64,   // Reserve of token A - 8 bytes
+        pub token_b_reserve: u64,   // Reserve of token B - 8 bytes
+        pub padding: [u8; 16],      // Padding to 64 bytes (multiple of 32)
     }
 
     /// User's search criteria - THIS IS THE SECRET
