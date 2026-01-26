@@ -12,5 +12,6 @@ encrypted-ixs/src/main.rs
 artifacts/
 .claude
 *.txt
-.DS_Store
+.DS_Storeb
+.env*
 .anchor

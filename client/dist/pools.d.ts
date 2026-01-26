@@ -1,4 +1,4 @@
-import { Connection, PublicKey, Commitment } from "@solana/web3.js";
+import { Connection, PublicKey, AccountInfo, Commitment } from "@solana/web3.js";
 import type { PoolData, PoolFilters } from "./types";
 /**
  * Raydium V4 AMM Program ID (Mainnet)
@@ -34,6 +34,30 @@ export declare function fetchRaydiumPools(connection: Connection, filters?: Pool
  * @returns Array of pool data (null entries are filtered out)
  */
 export declare function getMultiplePools(connection: Connection, poolAddresses: PublicKey[], commitment?: Commitment): Promise<PoolData[]>;
+/**
+ * Extract vault pubkeys from Raydium pool for fetching actual balances
+ *
+ * @param accountInfo - Pool account data
+ * @returns Base and quote vault pubkeys
+ */
+export declare function extractVaultPubkeys(accountInfo: AccountInfo<Buffer>): {
+    baseVault: PublicKey;
+    quoteVault: PublicKey;
+} | null;
+/**
+ * Fetch pools with actual vault balances (more accurate TVL)
+ *
+ * This makes additional RPC calls to fetch vault token balances
+ * Use for higher accuracy when pool count is small
+ *
+ * @param connection - Solana connection (QuickNode endpoint)
+ * @param pools - Pools from fetchRaydiumPools
+ * @returns Pools with accurate reserve amounts
+ */
+export declare function enrichPoolsWithVaultBalances(connection: Connection, pools: Array<{
+    address: PublicKey;
+    accountInfo: AccountInfo<Buffer>;
+}>): Promise<PoolData[]>;
 /**
  * Calculate TVL from pool reserves
  *

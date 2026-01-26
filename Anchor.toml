@@ -9,13 +9,21 @@ skip-lint = false
 
 [programs.localnet]
 priven = "BDcL3jAuBxfNGuWiDD37AETQfLUgc1hXn8gkb1fCDqaJ"
+priven_tee = "EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM"
+
+[programs.devnet]
+priven_tee = "EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
+cluster = "devnet"
 wallet = "~/.config/solana/id.json"
+
+# QuickNode RPC endpoint for devnet
+[provider.devnet]
+cluster = "https://prettiest-withered-dew.solana-devnet.quiknode.pro/REDACTED_TOKEN/"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""

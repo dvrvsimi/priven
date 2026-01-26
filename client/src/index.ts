@@ -1,12 +1,12 @@
 /**
  * Priven SDK - Privacy-Preserving Pool Queries on Solana
  *
- * Query Raydium liquidity pools privately using Multi-Party Computation (MPC)
- * Powered by QuickNode RPC and Arcium MPC
+ * Query Raydium liquidity pools privately using MagicBlock TEE
+ * Powered by QuickNode RPC and MagicBlock's Private Ephemeral Rollups
  */
 
 // Main client
-export { PrivenClient, createPrivenClient } from "./client";
+export { PrivenClient, createPrivenClient, PRIVEN_TEE_PROGRAM_ID } from "./client";
 
 // Types
 export type {
@@ -19,7 +19,24 @@ export type {
 } from "./types";
 
 // Encryption utilities
-export { encryptPredicate, decryptResult } from "./encryption";
+export { encryptPredicate, decryptResult, generateKeyPair } from "./encryption";
+
+// TEE utilities
+export {
+  createTeeSession,
+  createTeeConnection,
+  createBaseConnection,
+  getTeeRpcUrl,
+  isSessionValid,
+  isDelegated,
+  waitForCommit,
+  DELEGATION_PROGRAM_ID,
+  PERMISSION_PROGRAM_ID,
+  MAGIC_PROGRAM_ID,
+  MAGICBLOCK_RPC,
+  TEE_VALIDATORS,
+} from "./tee";
+export type { TeeSession } from "./tee";
 
 // Pool fetching (QuickNode integration)
 export {

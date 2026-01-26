@@ -1,63 +1,63 @@
-import { Program, AnchorProvider } from "@coral-xyz/anchor";
+/**
+ * Priven TEE Client
+ *
+ * Privacy-preserving pool queries using MagicBlock TEE
+ */
+import { Program, BN } from "@coral-xyz/anchor";
 import { Connection, PublicKey, Keypair } from "@solana/web3.js";
 import type { Predicate, QueryOptions } from "./types";
+export declare const PRIVEN_TEE_PROGRAM_ID: PublicKey;
 /**
- * Main client for Priven protocol
- *
- * Executes privacy-preserving pool queries using MPC
+ * Main client for Priven TEE protocol
  */
 export declare class PrivenClient {
     private program;
-    private connection;
-    private provider;
-    private privateKey;
-    private publicKey;
+    private wallet;
+    private baseConnection;
+    private teeSession;
+    constructor(program: Program, wallet: Keypair, baseConnection: Connection);
     /**
-     * Create a new Priven client
-     *
-     * @param program - Anchor program instance for Priven
-     * @param provider - Anchor provider with wallet
+     * Initialize TEE session (call before queries)
      */
-    constructor(program: Program, provider: AnchorProvider);
+    initTeeSession(): Promise<void>;
     /**
      * Execute a private pool query
      *
      * Flow:
-     * 1. Fetch MXE public key from on-chain
-     * 2. Fetch pools from QuickNode
-     * 3. Encrypt predicate
-     * 4. Submit transaction with encrypted predicate
-     * 5. Wait for MPC computation
-     * 6. Fetch and decrypt results
-     *
-     * @param predicate - Search criteria (min_tvl, max_tvl)
-     * @param options - Query options (filters, timeout, etc.)
-     * @returns Array of matching pool addresses
+     * 1. Fetch pools from QuickNode
+     * 2. Encrypt predicate (AES-256-GCM)
+     * 3. Submit query to L1 (creates QueryState)
+     * 4. Delegate QueryState to TEE
+     * 5. Execute query in TEE
+     * 6. Commit and fetch results
      */
     query(predicate: Predicate, options?: QueryOptions): Promise<PublicKey[]>;
     /**
-     * Submit encrypted query to Priven program
-     *
-     * @param encrypted - Encrypted predicate
-     * @param poolAddresses - Pool addresses to query
-     * @returns Computation offset for result tracking
+     * Submit query to L1
      */
     private submitQuery;
     /**
-     * Fetch and decrypt query results from on-chain
-     *
-     * @param computationOffset - Computation offset from submission
-     * @returns Array of matching pool addresses
+     * Delegate query to TEE
+     */
+    private delegateQuery;
+    /**
+     * Execute query in TEE
+     */
+    private executeInTee;
+    /**
+     * Commit result back to L1
+     */
+    private commitResult;
+    /**
+     * Fetch and decrypt results
      */
     private fetchAndDecryptResults;
+    deriveConfigPda(): [PublicKey, number];
+    deriveQueryStatePda(queryId: BN): [PublicKey, number];
+    deriveQueryResultPda(queryId: BN): [PublicKey, number];
 }
 /**
- * Helper function to create a Priven client from connection and program ID
- *
- * @param connection - Solana connection (QuickNode endpoint)
- * @param programId - Priven program ID
- * @param wallet - Wallet keypair
- * @returns Initialized Priven client
+ * Create a Priven TEE client
  */
-export declare function createPrivenClient(connection: Connection, programId: PublicKey, wallet: Keypair): Promise<PrivenClient>;
+export declare function createPrivenClient(connection: Connection, wallet: Keypair, programId?: PublicKey): Promise<PrivenClient>;
 //# sourceMappingURL=client.d.ts.map

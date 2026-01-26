@@ -1,7 +1,7 @@
 {
   "name": "priven-sdk",
   "version": "0.1.0",
-  "description": "Privacy-preserving pool queries on Solana using MPC",
+  "description": "Privacy-preserving pool queries on Solana using MagicBlock TEE",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "type": "module",
@@ -11,7 +11,8 @@
   },
   "keywords": [
     "solana",
-    "arcium",
+    "magicblock",
+    "tee",
     "privacy",
     "quicknode"
   ],
@@ -20,7 +21,8 @@
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",
     "@solana/web3.js": "^1.98.4",
-    "@arcium-hq/client": "0.6.3"
+    "@magicblock-labs/ephemeral-rollups-sdk": "^0.8.0",
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
     "typescript": "^5.9.3",
