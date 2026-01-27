@@ -154,7 +154,7 @@ export class StreamsClient {
       throw new Error(`Failed to create stream: ${response.status} - ${error}`);
     }
 
-    const result = await response.json();
+    const result: any = await response.json();
     console.log("✓ Stream created:", result.id);
 
     return {
@@ -181,7 +181,7 @@ export class StreamsClient {
       throw new Error(`Failed to list streams: ${response.status}`);
     }
 
-    const result = await response.json();
+    const result: any = await response.json();
     return (result.data || []).map((s: any) => ({
       id: s.id,
       name: s.name,
@@ -210,7 +210,7 @@ export class StreamsClient {
       throw new Error(`Failed to get stream: ${response.status}`);
     }
 
-    const s = await response.json();
+    const s: any = await response.json();
     return {
       id: s.id,
       name: s.name,

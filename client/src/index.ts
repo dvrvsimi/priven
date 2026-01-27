@@ -6,11 +6,14 @@
  */
 
 // Main client
-export { PrivenClient, createPrivenClient, PRIVEN_TEE_PROGRAM_ID } from "./client";
+export { PrivenClient, createPrivenClient, PRIVEN_PROGRAM_ID, PRIVEN_TEE_PROGRAM_ID } from "./client";
 
 // Types
 export type {
   Predicate,
+  PredicateV1,
+  PredicateV2,
+  Filter,
   EncryptedPredicate,
   PoolData,
   QueryResult,
@@ -18,8 +21,29 @@ export type {
   PoolFilters,
 } from "./types";
 
+// Type guards and enums
+export {
+  FilterType,
+  FilterOp,
+  isPredicateV1,
+  isPredicateV2,
+  ENCRYPTED_PREDICATE_SIZE,
+  ENCRYPTED_PREDICATE_SIZE_V1,
+  MAX_FILTERS,
+  FILTER_SIZE,
+} from "./types";
+
 // Encryption utilities
-export { encryptPredicate, decryptResult, generateKeyPair } from "./encryption";
+export {
+  encryptPredicate,
+  decryptResult,
+  generateKeyPair,
+  createTvlPredicate,
+  createPredicate,
+  createFilter,
+  convertV1ToV2,
+  PredicateBuilder,
+} from "./encryption";
 
 // TEE utilities
 export {
@@ -47,6 +71,17 @@ export {
   RAYDIUM_V4_PROGRAM_ID,
   RAYDIUM_POOL_SIZE,
 } from "./pools";
+
+// Token account fetching (works on devnet)
+export {
+  fetchTokenAccounts,
+  fetchTokenAccountsByOwner,
+  fetchTokenAccountsWithRetry,
+  toPoolData,
+  TOKEN_PROGRAM_ID,
+  KNOWN_MINTS,
+} from "./tokens";
+export type { TokenAccountData, TokenFilters } from "./tokens";
 
 // Re-export commonly used Solana types
 export { PublicKey, Connection, Keypair } from "@solana/web3.js";

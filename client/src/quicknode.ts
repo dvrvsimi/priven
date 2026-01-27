@@ -84,16 +84,12 @@ export class QuickNodeClient {
     console.log(`Sending smart transaction with fee level: ${feeLevel}`);
 
     try {
-      const signature = await this.endpoint.sendSmartTransaction(
-        {
-          transaction,
-          keyPair: signer,
-          feeLevel,
-        },
-        {
-          commitment: "confirmed",
-        }
-      );
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const signature = await (this.endpoint as any).sendSmartTransaction({
+        transaction,
+        keyPair: signer,
+        feeLevel,
+      });
 
       console.log(`Transaction sent: ${signature}`);
       return signature;
@@ -146,13 +142,14 @@ export class QuickNodeClient {
   ): Promise<PriorityFeeEstimate> {
     console.log(`Fetching priority fee estimates (last ${lastNBlocks} blocks)`);
 
-    const fees = await this.endpoint.fetchEstimatePriorityFees({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fees: any = await this.endpoint.fetchEstimatePriorityFees({
       last_n_blocks: lastNBlocks,
       account: programId?.toBase58(),
     });
 
-    // Extract per-compute-unit fees
-    const perCU = fees.per_compute_unit;
+    // Extract per-compute-unit fees (API structure may vary)
+    const perCU = fees.per_compute_unit || fees;
 
     return {
       low: perCU.low || 0,

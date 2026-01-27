@@ -1,19 +1,91 @@
 import { PublicKey, Commitment } from "@solana/web3.js";
 /**
- * User's search criteria for pool queries
- * These values are encrypted and evaluated privately in TEE
+ * Filter types for predicate evaluation (matches Rust FilterType enum)
  */
-export interface Predicate {
+export declare enum FilterType {
+    TVL = 0,
+    BALANCE = 1,
+    VOLUME_24H = 2,
+    FEE_RATE = 3,
+    PRICE = 4,
+    APY = 5,
+    RESERVE_A = 6,
+    RESERVE_B = 7,
+    RATIO = 8,
+    MINT = 9,
+    PROGRAM = 10,
+    SLOT_AGE = 11
+}
+/**
+ * Filter comparison operations (matches Rust FilterOp enum)
+ */
+export declare enum FilterOp {
+    GTE = 0,// >=
+    LTE = 1,// <=
+    EQ = 2,// ==
+    NEQ = 3
+}
+/**
+ * Single filter in V2 predicate (11 bytes when serialized)
+ */
+export interface Filter {
+    /** Filter type (what field to compare) */
+    type: FilterType;
+    /** Comparison operation */
+    op: FilterOp;
+    /** Reserved field for future use (default: 0) */
+    field?: number;
+    /** Value to compare against */
+    value: bigint;
+}
+/**
+ * Legacy V1 predicate - simple min/max TVL range
+ * @deprecated Use PredicateV2 for more flexibility
+ */
+export interface PredicateV1 {
     /** Minimum TVL in lamports (token_a_reserve + token_b_reserve) */
     minTvl: bigint;
     /** Maximum TVL in lamports */
     maxTvl: bigint;
 }
 /**
+ * V2 predicate with flexible filters (max 4 filters)
+ *
+ * Serialized format: [version: u8][filter_count: u8][filters: Filter[]]
+ * Each filter: [type: u8][op: u8][field: u8][value: u64] = 11 bytes
+ * Total: 2 + (11 * 4) = 46 bytes plaintext -> 80 bytes encrypted
+ */
+export interface PredicateV2 {
+    /** Version marker (always 2) */
+    version: 2;
+    /** Array of filters to apply (AND logic, max 4) */
+    filters: Filter[];
+}
+/**
+ * Union type for both predicate versions
+ */
+export type Predicate = PredicateV1 | PredicateV2;
+/**
+ * Type guard to check if predicate is V2
+ */
+export declare function isPredicateV2(predicate: Predicate): predicate is PredicateV2;
+/**
+ * Type guard to check if predicate is V1 (legacy)
+ */
+export declare function isPredicateV1(predicate: Predicate): predicate is PredicateV1;
+/** Encrypted predicate size for V1 (legacy): 16 bytes plaintext + 12 nonce + 16 tag = 44 bytes */
+export declare const ENCRYPTED_PREDICATE_SIZE_V1 = 44;
+/** Encrypted predicate size for V2: 46 bytes plaintext + padding + 12 nonce + 16 tag = 80 bytes */
+export declare const ENCRYPTED_PREDICATE_SIZE = 80;
+/** Maximum filters in V2 predicate */
+export declare const MAX_FILTERS = 4;
+/** Size of each filter when serialized */
+export declare const FILTER_SIZE = 11;
+/**
  * Encrypted predicate ready for submission to TEE
  */
 export interface EncryptedPredicate {
-    /** Encrypted ciphertext - 44 bytes (16 ct + 12 nonce + 16 tag) */
+    /** Encrypted ciphertext - 80 bytes for V2 (padded plaintext + 12 nonce + 16 tag) */
     ciphertext: Uint8Array;
     /** Ephemeral X25519 public key for encryption (32 bytes) */
     publicKey: Uint8Array;
@@ -89,7 +161,7 @@ export interface QueryStateAccount {
     owner: PublicKey;
     /** Unique query identifier */
     queryId: bigint;
-    /** Encrypted predicate (44 bytes) */
+    /** Encrypted predicate (80 bytes for V2, 44 bytes for V1 legacy) */
     encryptedPredicate: Uint8Array;
     /** User's ephemeral public key */
     userPubkey: Uint8Array;

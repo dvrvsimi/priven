@@ -8,11 +8,10 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-priven = "BDcL3jAuBxfNGuWiDD37AETQfLUgc1hXn8gkb1fCDqaJ"
-priven_tee = "EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM"
+priven = "EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM"
 
 [programs.devnet]
-priven_tee = "EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM"
+priven = "EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM"
 
 [registry]
 url = "https://api.apr.dev"

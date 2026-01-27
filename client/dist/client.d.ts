@@ -1,14 +1,15 @@
 /**
- * Priven TEE Client
+ * Priven Client
  *
  * Privacy-preserving pool queries using MagicBlock TEE
  */
 import { Program, BN } from "@coral-xyz/anchor";
 import { Connection, PublicKey, Keypair } from "@solana/web3.js";
 import type { Predicate, QueryOptions } from "./types";
-export declare const PRIVEN_TEE_PROGRAM_ID: PublicKey;
+import { PRIVEN_PROGRAM_ID, PRIVEN_TEE_PROGRAM_ID } from "./constants";
+export { PRIVEN_PROGRAM_ID, PRIVEN_TEE_PROGRAM_ID };
 /**
- * Main client for Priven TEE protocol
+ * Main client for Priven protocol
  */
 export declare class PrivenClient {
     private program;
@@ -57,7 +58,7 @@ export declare class PrivenClient {
     deriveQueryResultPda(queryId: BN): [PublicKey, number];
 }
 /**
- * Create a Priven TEE client
+ * Create a Priven client
  */
 export declare function createPrivenClient(connection: Connection, wallet: Keypair, programId?: PublicKey): Promise<PrivenClient>;
 //# sourceMappingURL=client.d.ts.map

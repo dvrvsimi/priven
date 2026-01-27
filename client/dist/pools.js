@@ -1,14 +1,24 @@
-import { PublicKey, } from "@solana/web3.js";
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.RAYDIUM_POOL_SIZE = exports.RAYDIUM_V4_PROGRAM_ID = void 0;
+exports.fetchRaydiumPools = fetchRaydiumPools;
+exports.getMultiplePools = getMultiplePools;
+exports.extractVaultPubkeys = extractVaultPubkeys;
+exports.enrichPoolsWithVaultBalances = enrichPoolsWithVaultBalances;
+exports.calculateTVL = calculateTVL;
+exports.sleep = sleep;
+exports.fetchRaydiumPoolsWithRetry = fetchRaydiumPoolsWithRetry;
+const web3_js_1 = require("@solana/web3.js");
 /**
  * Raydium V4 AMM Program ID (Mainnet)
  * Devnet: HWy1jotHpo6UqeQxx49dpYYdQB8wj9Qk9MdxwjLvDHB8
  */
-export const RAYDIUM_V4_PROGRAM_ID = new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+exports.RAYDIUM_V4_PROGRAM_ID = new web3_js_1.PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
 /**
  * Raydium V4 pool account size (bytes)
  * V4 AMM pools are exactly 752 bytes
  */
-export const RAYDIUM_POOL_SIZE = 752;
+exports.RAYDIUM_POOL_SIZE = 752;
 /**
  * Fetch all Raydium V4 pools from QuickNode RPC
  *
@@ -20,12 +30,12 @@ export const RAYDIUM_POOL_SIZE = 752;
  * @param commitment - Confirmation commitment level
  * @returns Array of pool data
  */
-export async function fetchRaydiumPools(connection, filters, commitment = "confirmed") {
+async function fetchRaydiumPools(connection, filters, commitment = "confirmed") {
     console.log("Fetching Raydium pools from QuickNode...");
     // Build program account filters
     const programFilters = [
         // Filter by exact account size (752 bytes for V4 AMM)
-        { dataSize: RAYDIUM_POOL_SIZE },
+        { dataSize: exports.RAYDIUM_POOL_SIZE },
     ];
     // Optional: Filter by pool status (offset 0, 8 bytes for u64)
     // status == 1 means active pool
@@ -51,7 +61,7 @@ export async function fetchRaydiumPools(connection, filters, commitment = "confi
     try {
         // Core QuickNode Integration: getProgramAccounts
         // This fetches all accounts owned by the Raydium program
-        const accounts = await connection.getProgramAccounts(RAYDIUM_V4_PROGRAM_ID, {
+        const accounts = await connection.getProgramAccounts(exports.RAYDIUM_V4_PROGRAM_ID, {
             filters: programFilters,
             commitment,
         });
@@ -87,7 +97,7 @@ export async function fetchRaydiumPools(connection, filters, commitment = "confi
  * @param commitment - Confirmation commitment level
  * @returns Array of pool data (null entries are filtered out)
  */
-export async function getMultiplePools(connection, poolAddresses, commitment = "confirmed") {
+async function getMultiplePools(connection, poolAddresses, commitment = "confirmed") {
     if (poolAddresses.length === 0) {
         return [];
     }
@@ -191,13 +201,13 @@ function parsePoolAccount(pubkey, accountInfo) {
     try {
         const data = accountInfo.data;
         // Validate account size
-        if (data.length !== RAYDIUM_POOL_SIZE) {
+        if (data.length !== exports.RAYDIUM_POOL_SIZE) {
             console.warn(`Invalid pool account size: ${data.length} bytes`);
             return null;
         }
         // Validate account owner
-        if (!accountInfo.owner.equals(RAYDIUM_V4_PROGRAM_ID)) {
-            console.warn(`Account owner mismatch: expected ${RAYDIUM_V4_PROGRAM_ID.toBase58()}, got ${accountInfo.owner.toBase58()}`);
+        if (!accountInfo.owner.equals(exports.RAYDIUM_V4_PROGRAM_ID)) {
+            console.warn(`Account owner mismatch: expected ${exports.RAYDIUM_V4_PROGRAM_ID.toBase58()}, got ${accountInfo.owner.toBase58()}`);
             return null;
         }
         // Check pool status (must be active = 1)
@@ -239,13 +249,13 @@ function parsePoolAccount(pubkey, accountInfo) {
  * @param accountInfo - Pool account data
  * @returns Base and quote vault pubkeys
  */
-export function extractVaultPubkeys(accountInfo) {
+function extractVaultPubkeys(accountInfo) {
     try {
         const data = accountInfo.data;
-        if (data.length !== RAYDIUM_POOL_SIZE)
+        if (data.length !== exports.RAYDIUM_POOL_SIZE)
             return null;
-        const baseVault = new PublicKey(data.subarray(RAYDIUM_V4_OFFSETS.baseVault, RAYDIUM_V4_OFFSETS.baseVault + 32));
-        const quoteVault = new PublicKey(data.subarray(RAYDIUM_V4_OFFSETS.quoteVault, RAYDIUM_V4_OFFSETS.quoteVault + 32));
+        const baseVault = new web3_js_1.PublicKey(data.subarray(RAYDIUM_V4_OFFSETS.baseVault, RAYDIUM_V4_OFFSETS.baseVault + 32));
+        const quoteVault = new web3_js_1.PublicKey(data.subarray(RAYDIUM_V4_OFFSETS.quoteVault, RAYDIUM_V4_OFFSETS.quoteVault + 32));
         return { baseVault, quoteVault };
     }
     catch {
@@ -262,7 +272,7 @@ export function extractVaultPubkeys(accountInfo) {
  * @param pools - Pools from fetchRaydiumPools
  * @returns Pools with accurate reserve amounts
  */
-export async function enrichPoolsWithVaultBalances(connection, pools) {
+async function enrichPoolsWithVaultBalances(connection, pools) {
     // Extract all vault addresses
     const vaultAddresses = [];
     const poolVaultMap = new Map();
@@ -315,7 +325,7 @@ export async function enrichPoolsWithVaultBalances(connection, pools) {
  * @param pool - Pool data
  * @returns Total value locked (sum of reserves)
  */
-export function calculateTVL(pool) {
+function calculateTVL(pool) {
     return pool.tokenAReserve + pool.tokenBReserve;
 }
 /**
@@ -324,7 +334,7 @@ export function calculateTVL(pool) {
  *
  * @param ms - Milliseconds to wait
  */
-export function sleep(ms) {
+function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 /**
@@ -337,7 +347,7 @@ export function sleep(ms) {
  * @param maxRetries - Maximum retry attempts
  * @returns Array of pool data
  */
-export async function fetchRaydiumPoolsWithRetry(connection, filters, maxRetries = 3) {
+async function fetchRaydiumPoolsWithRetry(connection, filters, maxRetries = 3) {
     let lastError = null;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {

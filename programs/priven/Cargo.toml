@@ -1,7 +1,7 @@
 [package]
 name = "priven"
 version = "0.1.0"
-description = "Created with Arcium & Anchor"
+description = "Privacy-preserving pool queries using MagicBlock TEE"
 edition = "2021"
 
 [lib]
@@ -14,17 +14,20 @@ cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build", "arcium-anchor/idl-build"]
+idl-build = ["anchor-lang/idl-build"]
 anchor-debug = []
 custom-heap = []
 custom-panic = []
 
 [dependencies]
 anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
-arcium-client = { default-features = false, version = "=0.6.3" }
-arcium-macros = "=0.6.3"
-arcium-anchor = "=0.6.3"
-wincode = "0.2.5"
+ephemeral-rollups-sdk = { version = "0.6", features = ["anchor"] }
+
+# Crypto dependencies for AES-GCM encryption/decryption
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

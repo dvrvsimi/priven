@@ -1,5 +1,5 @@
 /**
- * Priven TEE Client
+ * Priven Client
  *
  * Privacy-preserving pool queries using MagicBlock TEE
  */
@@ -13,19 +13,32 @@ import {
 } from "@solana/web3.js";
 import type {
   Predicate,
+  PredicateV1,
+  PredicateV2,
   QueryOptions,
   PoolData,
   EncryptedPredicate,
 } from "./types";
-import { encryptPredicate, decryptResult } from "./encryption";
+import { isPredicateV1, isPredicateV2 } from "./types";
+import { encryptPredicate, decryptResult, convertV1ToV2 } from "./encryption";
 import { fetchRaydiumPoolsWithRetry } from "./pools";
 import {
   TeeSession,
   createTeeSession,
   createTeeConnection,
   waitForCommit,
-  TEE_VALIDATORS,
 } from "./tee";
+import {
+  PRIVEN_PROGRAM_ID,
+  PRIVEN_TEE_PROGRAM_ID,
+  TEE_VALIDATORS,
+  QUERY_SEED,
+  RESULT_SEED,
+  CONFIG_SEED,
+} from "./constants";
+
+// Re-export for backwards compatibility
+export { PRIVEN_PROGRAM_ID, PRIVEN_TEE_PROGRAM_ID };
 
 // Helper to sign transactions
 function signTransaction<T extends Transaction | VersionedTransaction>(
@@ -50,18 +63,9 @@ function signAllTransactions<T extends Transaction | VersionedTransaction>(
   return txs;
 }
 
-// Priven TEE Program ID
-export const PRIVEN_TEE_PROGRAM_ID = new PublicKey(
-  "EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM"
-);
-
-// Seeds
-const QUERY_SEED = Buffer.from("query");
-const RESULT_SEED = Buffer.from("result");
-const CONFIG_SEED = Buffer.from("config");
 
 /**
- * Main client for Priven TEE protocol
+ * Main client for Priven protocol
  */
 export class PrivenClient {
   private program: Program;
@@ -114,8 +118,14 @@ export class PrivenClient {
     }
 
     console.log("Starting private pool query (TEE)...");
-    console.log(`  Min TVL: ${predicate.minTvl}`);
-    console.log(`  Max TVL: ${predicate.maxTvl}`);
+    if (isPredicateV2(predicate)) {
+      console.log(`  Predicate V2: ${predicate.filters.length} filter(s)`);
+      for (const f of predicate.filters) {
+        console.log(`    - Type=${f.type}, Op=${f.op}, Value=${f.value}`);
+      }
+    } else if (isPredicateV1(predicate)) {
+      console.log(`  Predicate V1: TVL range ${predicate.minTvl} - ${predicate.maxTvl}`);
+    }
 
     // Step 1: Fetch pools
     console.log("\nStep 1/6: Fetching pools from QuickNode...");
@@ -360,12 +370,12 @@ export class PrivenClient {
 }
 
 /**
- * Create a Priven TEE client
+ * Create a Priven client
  */
 export async function createPrivenClient(
   connection: Connection,
   wallet: Keypair,
-  programId: PublicKey = PRIVEN_TEE_PROGRAM_ID
+  programId: PublicKey = PRIVEN_PROGRAM_ID
 ): Promise<PrivenClient> {
   const provider = new AnchorProvider(
     connection,

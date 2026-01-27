@@ -1,43 +1,42 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.PrivenClient = exports.PRIVEN_TEE_PROGRAM_ID = exports.PRIVEN_PROGRAM_ID = void 0;
+exports.createPrivenClient = createPrivenClient;
 /**
- * Priven TEE Client
+ * Priven Client
  *
  * Privacy-preserving pool queries using MagicBlock TEE
  */
-import { Program, AnchorProvider, BN } from "@coral-xyz/anchor";
-import { PublicKey, Transaction, } from "@solana/web3.js";
-import { encryptPredicate, decryptResult } from "./encryption";
-import { fetchRaydiumPoolsWithRetry } from "./pools";
-import { createTeeSession, createTeeConnection, waitForCommit, TEE_VALIDATORS, } from "./tee";
+const anchor_1 = require("@coral-xyz/anchor");
+const web3_js_1 = require("@solana/web3.js");
+const types_1 = require("./types");
+const encryption_1 = require("./encryption");
+const pools_1 = require("./pools");
+const tee_1 = require("./tee");
+const constants_1 = require("./constants");
+Object.defineProperty(exports, "PRIVEN_PROGRAM_ID", { enumerable: true, get: function () { return constants_1.PRIVEN_PROGRAM_ID; } });
+Object.defineProperty(exports, "PRIVEN_TEE_PROGRAM_ID", { enumerable: true, get: function () { return constants_1.PRIVEN_TEE_PROGRAM_ID; } });
 // Helper to sign transactions
 function signTransaction(tx, wallet) {
-    if (tx instanceof Transaction) {
+    if (tx instanceof web3_js_1.Transaction) {
         tx.partialSign(wallet);
     }
     return tx;
 }
 function signAllTransactions(txs, wallet) {
     txs.forEach((tx) => {
-        if (tx instanceof Transaction) {
+        if (tx instanceof web3_js_1.Transaction) {
             tx.partialSign(wallet);
         }
     });
     return txs;
 }
-// Priven TEE Program ID
-export const PRIVEN_TEE_PROGRAM_ID = new PublicKey("EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM");
-// Seeds
-const QUERY_SEED = Buffer.from("query");
-const RESULT_SEED = Buffer.from("result");
-const CONFIG_SEED = Buffer.from("config");
 /**
- * Main client for Priven TEE protocol
+ * Main client for Priven protocol
  */
-export class PrivenClient {
-    program;
-    wallet;
-    baseConnection;
-    teeSession = null;
+class PrivenClient {
     constructor(program, wallet, baseConnection) {
+        this.teeSession = null;
         this.program = program;
         this.wallet = wallet;
         this.baseConnection = baseConnection;
@@ -46,7 +45,7 @@ export class PrivenClient {
      * Initialize TEE session (call before queries)
      */
     async initTeeSession() {
-        this.teeSession = await createTeeSession(this.wallet, this.baseConnection.rpcEndpoint);
+        this.teeSession = await (0, tee_1.createTeeSession)(this.wallet, this.baseConnection.rpcEndpoint);
         console.log(`TEE session created (verified: ${this.teeSession.verified})`);
     }
     /**
@@ -68,11 +67,18 @@ export class PrivenClient {
             await this.initTeeSession();
         }
         console.log("Starting private pool query (TEE)...");
-        console.log(`  Min TVL: ${predicate.minTvl}`);
-        console.log(`  Max TVL: ${predicate.maxTvl}`);
+        if ((0, types_1.isPredicateV2)(predicate)) {
+            console.log(`  Predicate V2: ${predicate.filters.length} filter(s)`);
+            for (const f of predicate.filters) {
+                console.log(`    - Type=${f.type}, Op=${f.op}, Value=${f.value}`);
+            }
+        }
+        else if ((0, types_1.isPredicateV1)(predicate)) {
+            console.log(`  Predicate V1: TVL range ${predicate.minTvl} - ${predicate.maxTvl}`);
+        }
         // Step 1: Fetch pools
         console.log("\nStep 1/6: Fetching pools from QuickNode...");
-        const pools = await fetchRaydiumPoolsWithRetry(this.baseConnection, {
+        const pools = await (0, pools_1.fetchRaydiumPoolsWithRetry)(this.baseConnection, {
             status: 1,
         });
         if (pools.length === 0) {
@@ -82,12 +88,12 @@ export class PrivenClient {
         console.log(`Selected ${selectedPools.length} pools`);
         // Step 2: Encrypt predicate
         console.log("\nStep 2/6: Encrypting search criteria...");
-        const teePublicKey = TEE_VALIDATORS.TEE.toBytes();
-        const encrypted = await encryptPredicate(predicate, teePublicKey);
+        const teePublicKey = constants_1.TEE_VALIDATORS.TEE.toBytes();
+        const encrypted = await (0, encryption_1.encryptPredicate)(predicate, teePublicKey);
         console.log("Predicate encrypted (AES-256-GCM)");
         // Step 3: Submit query to L1
         console.log("\nStep 3/6: Submitting query to L1...");
-        const queryId = new BN(Date.now() * 1000 + Math.floor(Math.random() * 1000));
+        const queryId = new anchor_1.BN(Date.now() * 1000 + Math.floor(Math.random() * 1000));
         const [queryStatePda] = this.deriveQueryStatePda(queryId);
         const [queryResultPda] = this.deriveQueryResultPda(queryId);
         await this.submitQuery(queryId, encrypted, selectedPools);
@@ -105,7 +111,7 @@ export class PrivenClient {
         console.log("\nStep 6/6: Committing and fetching results...");
         await this.commitResult(queryId);
         // Wait for result on L1
-        const committed = await waitForCommit(this.baseConnection, queryResultPda, timeout);
+        const committed = await (0, tee_1.waitForCommit)(this.baseConnection, queryResultPda, timeout);
         if (!committed) {
             throw new Error("Timeout waiting for result commit");
         }
@@ -120,8 +126,8 @@ export class PrivenClient {
     async submitQuery(queryId, encrypted, pools) {
         const poolData = pools.map((p) => ({
             address: p.address,
-            tokenAReserve: new BN(p.tokenAReserve.toString()),
-            tokenBReserve: new BN(p.tokenBReserve.toString()),
+            tokenAReserve: new anchor_1.BN(p.tokenAReserve.toString()),
+            tokenBReserve: new anchor_1.BN(p.tokenBReserve.toString()),
         }));
         const tx = await this.program.methods
             .submitQuery(queryId, Array.from(encrypted.ciphertext), Array.from(encrypted.publicKey), poolData)
@@ -153,20 +159,20 @@ export class PrivenClient {
             throw new Error("TEE session not initialized");
         }
         // Create connection to TEE RPC
-        const teeConnection = createTeeConnection(this.teeSession);
+        const teeConnection = (0, tee_1.createTeeConnection)(this.teeSession);
         // Create provider for TEE
-        const teeProvider = new AnchorProvider(teeConnection, {
+        const teeProvider = new anchor_1.AnchorProvider(teeConnection, {
             publicKey: this.wallet.publicKey,
             signTransaction: async (tx) => signTransaction(tx, this.wallet),
             signAllTransactions: async (txs) => signAllTransactions(txs, this.wallet),
         }, { commitment: "confirmed" });
         // Create program instance for TEE
-        const teeProgram = new Program(this.program.idl, teeProvider);
+        const teeProgram = new anchor_1.Program(this.program.idl, teeProvider);
         // Execute in TEE
         const tx = await teeProgram.methods
             .executeQuery(Array.from(decryptionKey.slice(0, 32)))
             .accounts({
-            teeValidator: TEE_VALIDATORS.TEE,
+            teeValidator: constants_1.TEE_VALIDATORS.TEE,
             payer: this.wallet.publicKey,
         })
             .signers([this.wallet])
@@ -180,13 +186,13 @@ export class PrivenClient {
         if (!this.teeSession) {
             throw new Error("TEE session not initialized");
         }
-        const teeConnection = createTeeConnection(this.teeSession);
-        const teeProvider = new AnchorProvider(teeConnection, {
+        const teeConnection = (0, tee_1.createTeeConnection)(this.teeSession);
+        const teeProvider = new anchor_1.AnchorProvider(teeConnection, {
             publicKey: this.wallet.publicKey,
             signTransaction: async (tx) => signTransaction(tx, this.wallet),
             signAllTransactions: async (txs) => signAllTransactions(txs, this.wallet),
         }, { commitment: "confirmed" });
-        const teeProgram = new Program(this.program.idl, teeProvider);
+        const teeProgram = new anchor_1.Program(this.program.idl, teeProvider);
         const tx = await teeProgram.methods
             .commitResult()
             .accounts({
@@ -206,33 +212,34 @@ export class PrivenClient {
             throw new Error("Query execution failed");
         }
         const encryptedResult = new Uint8Array(queryResult.encryptedResult.slice(0, queryResult.encryptedLen));
-        const result = await decryptResult(encryptedResult, privateKey, teePublicKey);
+        const result = await (0, encryption_1.decryptResult)(encryptedResult, privateKey, teePublicKey);
         return result.matches;
     }
     // PDA derivation helpers
     deriveConfigPda() {
-        return PublicKey.findProgramAddressSync([CONFIG_SEED], this.program.programId);
+        return web3_js_1.PublicKey.findProgramAddressSync([constants_1.CONFIG_SEED], this.program.programId);
     }
     deriveQueryStatePda(queryId) {
-        return PublicKey.findProgramAddressSync([QUERY_SEED, this.wallet.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)], this.program.programId);
+        return web3_js_1.PublicKey.findProgramAddressSync([constants_1.QUERY_SEED, this.wallet.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)], this.program.programId);
     }
     deriveQueryResultPda(queryId) {
-        return PublicKey.findProgramAddressSync([RESULT_SEED, this.wallet.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)], this.program.programId);
+        return web3_js_1.PublicKey.findProgramAddressSync([constants_1.RESULT_SEED, this.wallet.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)], this.program.programId);
     }
 }
+exports.PrivenClient = PrivenClient;
 /**
- * Create a Priven TEE client
+ * Create a Priven client
  */
-export async function createPrivenClient(connection, wallet, programId = PRIVEN_TEE_PROGRAM_ID) {
-    const provider = new AnchorProvider(connection, {
+async function createPrivenClient(connection, wallet, programId = constants_1.PRIVEN_PROGRAM_ID) {
+    const provider = new anchor_1.AnchorProvider(connection, {
         publicKey: wallet.publicKey,
         signTransaction: async (tx) => signTransaction(tx, wallet),
         signAllTransactions: async (txs) => signAllTransactions(txs, wallet),
     }, { commitment: "confirmed" });
-    const idl = await Program.fetchIdl(programId, provider);
+    const idl = await anchor_1.Program.fetchIdl(programId, provider);
     if (!idl) {
         throw new Error("Failed to fetch program IDL");
     }
-    const program = new Program(idl, provider);
+    const program = new anchor_1.Program(idl, provider);
     return new PrivenClient(program, wallet, connection);
 }

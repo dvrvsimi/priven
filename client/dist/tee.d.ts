@@ -1,23 +1,12 @@
 /**
  * TEE Authentication and Communication Helpers
  *
- * Uses MagicBlock's ephemeral-rollups-sdk for TEE integration
+ * Uses MagicBlock's ephemeral-rollups-sdk for TEE integration.
+ * Implements proper auth token handling with refresh mechanism.
  */
 import { Connection, PublicKey, Keypair } from "@solana/web3.js";
-export declare const DELEGATION_PROGRAM_ID: PublicKey;
-export declare const PERMISSION_PROGRAM_ID: PublicKey;
-export declare const MAGIC_PROGRAM_ID: PublicKey;
-export declare const MAGICBLOCK_RPC: {
-    readonly devnet: "https://devnet.magicblock.app";
-    readonly mainnet: "https://mainnet.magicblock.app";
-    readonly tee: "https://tee.magicblock.app";
-};
-export declare const TEE_VALIDATORS: {
-    readonly TEE: PublicKey;
-    readonly US: PublicKey;
-    readonly EU: PublicKey;
-    readonly ASIA: PublicKey;
-};
+import { DELEGATION_PROGRAM_ID, PERMISSION_PROGRAM_ID, MAGIC_PROGRAM_ID, MAGICBLOCK_RPC, TEE_VALIDATORS } from "./constants";
+export { DELEGATION_PROGRAM_ID, PERMISSION_PROGRAM_ID, MAGIC_PROGRAM_ID, MAGICBLOCK_RPC, TEE_VALIDATORS, };
 /**
  * TEE session with auth token
  */
@@ -32,15 +21,44 @@ export interface TeeSession {
     expiresAt: number;
     /** Whether TEE integrity is verified */
     verified: boolean;
+    /** Wallet used to create this session (for refresh) */
+    walletPublicKey: string;
+}
+/**
+ * Error thrown when TEE authentication fails
+ */
+export declare class TeeAuthError extends Error {
+    readonly cause?: Error | undefined;
+    constructor(message: string, cause?: Error | undefined);
 }
 /**
  * Create and authenticate a TEE session
  *
  * @param wallet - Wallet keypair for signing auth request
  * @param baseRpc - Base RPC endpoint (defaults to devnet)
+ * @param options - Optional configuration
  * @returns Authenticated TEE session
+ * @throws TeeAuthError if authentication fails after retries
  */
-export declare function createTeeSession(wallet: Keypair, baseRpc?: string): Promise<TeeSession>;
+export declare function createTeeSession(wallet: Keypair, baseRpc?: string, options?: {
+    skipIntegrityCheck?: boolean;
+    maxRetries?: number;
+}): Promise<TeeSession>;
+/**
+ * Refresh a TEE session if it's expired or about to expire
+ *
+ * @param session - Current session
+ * @param wallet - Wallet keypair for signing
+ * @returns New or existing session
+ */
+export declare function refreshSessionIfNeeded(session: TeeSession, wallet: Keypair): Promise<TeeSession>;
+/**
+ * Validate that a session is still usable
+ *
+ * @param session - Session to validate
+ * @throws TeeAuthError if session is invalid or expired
+ */
+export declare function validateSession(session: TeeSession): void;
 /**
  * Get TEE RPC URL with auth token
  */
@@ -59,8 +77,9 @@ export declare function createTeeConnection(session: TeeSession): Connection;
 export declare function createBaseConnection(session: TeeSession): Connection;
 /**
  * Derive delegation buffer PDA
+ * NOTE: Buffer is derived from the OWNER PROGRAM, not delegation program
  */
-export declare function deriveDelegationBufferPda(delegatedAccount: PublicKey): [PublicKey, number];
+export declare function deriveDelegationBufferPda(delegatedAccount: PublicKey, ownerProgramId: PublicKey): [PublicKey, number];
 /**
  * Derive delegation record PDA
  */
