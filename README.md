@@ -1,178 +1,176 @@
 # Priven - Private Pool Queries on Solana
 
-**Privacy-Preserving DeFi Queries Using Multi-Party Computation**
+**Privacy-Preserving DeFi Queries Using MagicBlock TEE**
 
-Priven enables private queries of Raydium liquidity pools without revealing your search criteria to anyone—not even the MPC nodes computing your results.
+Priven enables private queries of Raydium liquidity pools without revealing your search criteria to anyone—not validators, not observers, only you see your filter criteria.
 
 ## Features
 
-- **Private Search Criteria** - Your predicate (TVL range, filters) never visible to anyone
-- **Verifiable Results** - BLS signatures ensure computation integrity
-- **QuickNode Integration** - Fast, reliable Solana data access
-- **MPC Privacy** - Arcium's threshold computation keeps secrets distributed
+- **Private Search Criteria** - Your predicate (TVL range, filters) encrypted end-to-end
+- **TEE Execution** - MagicBlock Ephemeral Rollups with Intel TDX attestation
+- **QuickNode Integration** - RPC for pool data, Streams for real-time events
+- **End-to-End Encryption** - Only you can decrypt the results
 
-## Architecture
+## How It Works
 
 ```
-CLIENT
-  1. Fetch pools from QuickNode
-  2. Encrypt predicate (min_tvl, max_tvl)
-  3. Submit query to Solana
-         |
-         v
-MXE PROGRAM (On-chain)
-  1. Read pool account data
-  2. Queue computation with encrypted predicate
-         |
-         v
-ARCIUM MPC CLUSTER
-  1. Secret-share predicate (no node sees plaintext)
-  2. Evaluate: tvl >= min && tvl <= max
-  3. Encrypt results to user's key
-         |
-         v
-CLIENT
-  1. Retrieve encrypted result
-  2. Decrypt locally
-  3. See matching pool addresses
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│    Client    │     │   Solana L1  │     │  MagicBlock  │     │   QuickNode  │
+│     SDK      │     │   Program    │     │     TEE      │     │   RPC/Streams│
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │                    │
+       │  1. Encrypt        │                    │                    │
+       │     predicate      │                    │                    │
+       │                    │                    │                    │
+       │  2. Fetch pools    │                    │                    │
+       │  ───────────────────────────────────────────────────────────►│
+       │  ◄───────────────────────────────────────────────────────────│
+       │                    │                    │                    │
+       │  3. Submit query   │                    │                    │
+       │  ─────────────────►│                    │                    │
+       │                    │                    │                    │
+       │  4. Delegate to    │                    │                    │
+       │     TEE ──────────►│───────────────────►│                    │
+       │                    │                    │                    │
+       │                    │                    │  5. Fetch state    │
+       │                    │                    │  ──────────────────►
+       │                    │                    │  ◄──────────────────
+       │                    │                    │                    │
+       │                    │                    │  6. Decrypt        │
+       │                    │                    │     predicate      │
+       │                    │                    │                    │
+       │                    │                    │  7. Evaluate       │
+       │                    │                    │     pools          │
+       │                    │                    │                    │
+       │                    │                    │  8. Encrypt        │
+       │                    │                    │     result         │
+       │                    │                    │                    │
+       │                    │  9. Store result   │                    │
+       │                    │◄───────────────────│                    │
+       │                    │                    │                    │
+       │  10. Fetch +       │                    │                    │
+       │      decrypt ◄─────│                    │                    │
+       │      result        │                    │                    │
+       │                    │                    │                    │
 ```
 
 ## QuickNode Integration
 
-Priven demonstrates meaningful use of QuickNode RPC for privacy-preserving DeFi:
-
-### Core RPC Methods Used
-
-**1. getProgramAccounts** - Fetch all Raydium V4 pools
-```typescript
-const pools = await connection.getProgramAccounts(RAYDIUM_V4_PROGRAM, {
-  filters: [{ dataSize: 752 }], // V4 pool size
-  commitment: "confirmed",
-});
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     QuickNode Integration                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     │
+│  │   RPC Calls  │     │   Streams    │     │  Functions   │     │
+│  └──────┬───────┘     └──────┬───────┘     └──────┬───────┘     │
+│         │                    │                    │             │
+│  getProgramAccounts    QuerySubmitted        Priority Fees      │
+│  getMultipleAccounts   QueryExecuted         Smart Routing      │
+│  getAccountInfo        Real-time events                         │
+│         │                    │                    │             │
+│         ▼                    ▼                    ▼             │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     │
+│  │  pools.ts    │     │  webhook/    │     │ quicknode.ts │     │
+│  │  tokens.ts   │     │  server      │     │              │     │
+│  └──────────────┘     └──────────────┘     └──────────────┘     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**2. getMultipleAccounts** - Batch fetch selected pool data
-```typescript
-const accounts = await connection.getMultipleAccountsInfo(
-  poolAddresses,
-  "confirmed"
-);
+### Streams Event Flow
+
+```
+┌──────────────┐     ┌─────────────────┐     ┌──────────────┐
+│  Solana L1   │────▶│ QuickNode Stream│────▶│   Webhook    │
+│  (events)    │     │ (filter/notify) │     │ (TEE trigger)│
+└──────────────┘     └─────────────────┘     └──────────────┘
+       │                                            │
+       │  QuerySubmitted                            │
+       │  QueryExecuted                             ▼
+       │                                    ┌──────────────┐
+       │                                    │ TEE Executor │
+       │                                    │   Service    │
+       │                                    └──────────────┘
 ```
 
-**3. getAccountInfo** - Retrieve MXE encryption keys
-```typescript
-const mxePublicKey = await getMXEPublicKey(connection, programId);
-```
+## Privacy Model
 
-### Privacy Model
-
-- **QuickNode sees:** Generic pool data requests (public anyway)
-- **MPC nodes see:** Secret shares of your search criteria (never reconstructed)
-- **Network sees:** An encrypted query transaction
-- **Only you see:** Which pools match your criteria
-
-This demonstrates how public data sources (QuickNode) can be combined with private computation (Arcium MPC) to enable privacy-preserving DeFi applications.
+| Observer | What They See |
+|----------|---------------|
+| L1 Validators | Encrypted ciphertext only |
+| QuickNode | Generic RPC calls (public data) |
+| TEE Operator | Nothing (Intel TDX enclave) |
+| Network Observers | Encrypted query + encrypted result |
+| **Only You** | Plaintext criteria + matching pools |
 
 ## Quick Start
 
-### SDK Usage
+### Prerequisites
+
+- Node.js 20+
+- Rust 1.75+ / Anchor 0.30+
+- Solana CLI
+- QuickNode account
+
+### Environment Setup
 
 ```bash
-npm install priven-sdk
+cp .env.example .env
 ```
+
+Edit `.env`:
+
+```env
+# Solana RPCs
+QUICKNODE_DEVNET_RPC=https://your-endpoint.quiknode.pro
+QUICKNODE_MAINNET_RPC=https://your-endpoint.quiknode.pro
+
+# QuickNode Streams
+QUICKNODE_API_KEY=your-api-key
+QUICKNODE_STREAM_ID=your-stream-id
+```
+
+### Install & Run
+
+```bash
+npm install
+cd client && npm install && npm run build
+
+# Run tests
+anchor test --skip-deploy
+```
+
+## Client SDK
 
 ```typescript
-import { PrivenClient } from 'priven-sdk';
-import { PublicKey } from '@solana/web3.js';
+import { PrivenClient } from 'priven-client';
 
-const client = new PrivenClient({
-  proxyUrl: 'https://priven-proxy.fly.dev',
+const client = new PrivenClient(connection, wallet);
+
+// Private query - only you know the filter criteria
+const matchingPools = await client.query({
+  minTvl: BigInt(1_000_000),
+  maxTvl: BigInt(10_000_000),
 });
-
-// Private account read
-const result = await client.getAccountInfo(
-  new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
-);
-
-console.log('Data:', result.data);
-console.log('Verified:', result.verified);
-console.log('Slot:', result.slot);
 ```
-
-### Running the Proxy
-
-```bash
-cd proxy
-cp .env.example .env
-# Edit .env with your QuickNode RPC URL
-cargo run
-```
-
-## Supported Methods
-
-| Method | Status | Description |
-|--------|--------|-------------|
-| `getAccountInfo` | ✅ Ready | Single account read |
-| `getMultipleAccounts` | ✅ Ready | Batch account reads |
-| `simulateTransaction` | ✅ Ready | Transaction simulation |
-
-## Security Model
-
-### Cryptographically Guaranteed
-
-- ✅ Response integrity via Merkle proofs
-- ✅ Commitment binding (client can't change query after commit)
-- ✅ Transport privacy via TLS
-
-### Operationally Assumed
-
-- Proxy does not log queries (auditable, open source)
-- QuickNode executes correctly (inherent to any RPC usage)
-- IP anonymity is out of scope (can add Tor/relay later)
 
 ## Project Structure
 
 ```
 priven/
-├── packages/
-│   └── priven-sdk/       # TypeScript client SDK
-├── proxy/                # Rust RPC proxy
-├── demo/                 # Demo web app
-├── plan.md              # Implementation plan
-└── README.md            # This file
-```
-
-## Development
-
-### Prerequisites
-
-- Rust 1.75+
-- Node.js 18+
-- QuickNode API key
-
-### Build
-
-```bash
-# Build proxy
-cd proxy
-cargo build --release
-
-# Build SDK
-cd packages/priven-sdk
-npm install
-npm run build
-```
-
-### Test
-
-```bash
-# Test proxy
-cd proxy
-cargo test
-
-# Test SDK
-cd packages/priven-sdk
-npm test
+├── programs/
+│   └── priven/             # Anchor program
+├── client/
+│   └── src/
+│       ├── client.ts       # PrivenClient SDK
+│       ├── encryption.ts   # X25519 + AES-GCM
+│       ├── tee.ts          # MagicBlock integration
+│       └── pools.ts        # Raydium pool fetching
+├── cli/                    # Command-line interface
+├── tests/                  # Integration tests
+├── webhook/                # QuickNode Streams server
+└── README.md
 ```
 
 ## License
@@ -181,4 +179,6 @@ MIT
 
 ## Acknowledgements
 
-Built for the Solana Privacy Hack with support from QuickNode.
+Built for the Solana Hackathon with:
+- [QuickNode](https://quicknode.com) - RPC and Streams
+- [MagicBlock](https://magicblock.gg) - Ephemeral Rollups + TEE

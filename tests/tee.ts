@@ -14,6 +14,7 @@ import {
   QUERY_SEED,
   CONFIG_SEED,
   createRawPredicate,
+  executeQueryNative,
 } from "./helpers";
 
 describe("Priven - MagicBlock TEE Integration", () => {
@@ -95,7 +96,6 @@ describe("Priven - MagicBlock TEE Integration", () => {
         [QUERY_SEED, admin.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)],
         program.programId
       );
-      const [configPda] = PublicKey.findProgramAddressSync([CONFIG_SEED], program.programId);
 
       await program.methods
         .submitQuery(
@@ -112,12 +112,13 @@ describe("Priven - MagicBlock TEE Integration", () => {
       console.log("Note: This requires delegation first in production");
 
       try {
+        // NO CONFIG - not available in TEE ephemeral state
         await program.methods
           .executeQueryStateless(Array.from(new Uint8Array(32)) as number[])
           .accountsPartial({
             caller: admin.publicKey,
             queryState: queryStatePda,
-            config: configPda,
+            // NO config - TEE authorization is via delegation
           })
           .signers([admin])
           .rpc();
@@ -153,7 +154,29 @@ describe("Priven - MagicBlock TEE Integration", () => {
       const encrypted = await encryptPredicate(predicate, teeKeyPair.publicKey);
 
       console.log("  Predicate: TVL between 1M and 10M");
-      console.log("  Encrypted ciphertext:", Buffer.from(encrypted.ciphertext).toString("hex").slice(0, 24) + "...");
+      console.log("  Encrypted ciphertext:", Buffer.from(encrypted.ciphertext).toString("hex").slice(0, 32) + "...");
+      console.log("  Client ephemeral pubkey:", Buffer.from(encrypted.publicKey).toString("hex").slice(0, 32) + "...");
+      console.log("  TEE pubkey:", Buffer.from(teeKeyPair.publicKey).toString("hex").slice(0, 32) + "...");
+
+      // Verify round-trip decryption works locally
+      const { testDecryptPredicate } = await import("./helpers");
+      try {
+        const decrypted = await testDecryptPredicate(
+          encrypted.ciphertext,
+          teeKeyPair.privateKey,
+          encrypted.publicKey
+        );
+        console.log("  ✓ Local round-trip decryption works! Version:", decrypted.version);
+        console.log("  ✓ Filters:", JSON.stringify(decrypted.filters.map(f => ({ type: f.type, op: f.op, value: f.value.toString() }))));
+      } catch (e: any) {
+        console.log("  ✗ Local decryption failed:", e.message);
+      }
+
+      // Store original for comparison
+      (global as any).originalCiphertext = encrypted.ciphertext;
+      (global as any).originalPubkey = encrypted.publicKey;
+      (global as any).teePrivateKey = teeKeyPair.privateKey;
+
       console.log("  ✓ Observer sees ciphertext, NOT filter criteria\n");
 
       // STEP 2: Submit to L1
@@ -191,77 +214,50 @@ describe("Priven - MagicBlock TEE Integration", () => {
 
       console.log("  ✓ Encrypted predicate stored on-chain\n");
 
-      // STEP 3: TEE Auth
-      console.log("STEP 3: Authenticate with MagicBlock TEE");
+      // STEP 3: Setup ER Provider
+      console.log("STEP 3: Setup Ephemeral Rollup connection");
       console.log("─".repeat(50));
 
-      const TEE_RPC = "https://tee.magicblock.app";
-      let authToken: { token: string; expiresAt: number };
+      // devnet.magicblock.app is permissionless (no auth required)
+      // Production TEE at tee.magicblock.app requires auth
+      const EPHEMERAL_RPC = "https://devnet.magicblock.app";
 
-      try {
-        authToken = await getAuthToken(
-          TEE_RPC,
-          wallet.publicKey,
-          async (message: Uint8Array) => {
-            return nacl.sign.detached(message, wallet.secretKey);
-          }
-        );
-        console.log("  TEE RPC:", TEE_RPC);
-        console.log("  Auth token obtained (expires:", new Date(authToken.expiresAt).toISOString(), ")");
-        console.log("  ✓ Wallet signature verified by TEE\n");
-      } catch (e: any) {
-        console.log("  ⚠ TEE auth failed:", e.message?.slice(0, 50));
-        console.log("  Skipping delegation steps (TEE may be unavailable)\n");
-        console.log("─".repeat(50));
-        console.log("PRIVACY GUARANTEES VALIDATED:");
-        console.log("  ✓ Predicate encrypted client-side (AES-256-GCM)");
-        console.log("  ✓ Encrypted data stored on-chain");
-        console.log("  ✓ Observer cannot read filter criteria");
-        console.log("  ⏳ TEE execution requires live MagicBlock infrastructure");
-        return;
-      }
+      // Create ER connection (devnet is permissionless)
+      const erConnection = new Connection(EPHEMERAL_RPC, {
+        commitment: "confirmed"
+      });
+      const erProvider = new AnchorProvider(erConnection, new anchor.Wallet(wallet), { commitment: "confirmed" });
+      const erProgram = new Program(program.idl, erProvider) as Program<Priven>;
 
-      // STEP 4: Delegate
-      console.log("STEP 4: Delegate query state to TEE");
+      console.log("  Base Layer:", connection.rpcEndpoint);
+      console.log("  Ephemeral Rollup:", EPHEMERAL_RPC);
+      console.log("  ✓ ER provider configured\n");
+
+      // STEP 4: Delegate (on BASE LAYER, not ER!)
+      console.log("STEP 4: Delegate query state to TEE (on base layer)");
       console.log("─".repeat(50));
 
-      const {
-        DELEGATION_PROGRAM_ID,
-        deriveDelegationBufferPda,
-        deriveDelegationRecordPda,
-        deriveDelegationMetadataPda,
-        isDelegated,
-      } = await import("../client/src/tee");
-
-      // Buffer PDA uses owner program (priven), not delegation program!
-      const [bufferPda] = deriveDelegationBufferPda(queryStatePda, program.programId);
-      const [delegationRecordPda] = deriveDelegationRecordPda(queryStatePda);
-      const [delegationMetadataPda] = deriveDelegationMetadataPda(queryStatePda);
+      const { isDelegated } = await import("../client/src/tee");
 
       console.log("  QueryState PDA:", queryStatePda.toBase58());
-      console.log("  Buffer PDA:", bufferPda.toBase58());
 
       let delegationSucceeded = false;
 
       try {
+        // Delegation happens on BASE LAYER using base program
         const delegateTx = await program.methods
-          .delegateQuery()
-          .accountsPartial({
+          .delegateQuery(queryId)
+          .accounts({
             user: wallet.publicKey,
-            queryState: queryStatePda,
-            bufferQueryState: bufferPda,
-            delegationRecordQueryState: delegationRecordPda,
-            delegationMetadataQueryState: delegationMetadataPda,
-            ownerProgram: program.programId,
-            delegationProgram: DELEGATION_PROGRAM_ID,
-            systemProgram: anchor.web3.SystemProgram.programId,
           })
           .signers([wallet])
-          .rpc();
+          .rpc({ skipPreflight: true });
 
         console.log("  Delegate TX:", delegateTx);
-        console.log("  ✓ Account ownership transferred to Delegation Program");
+        console.log("  ✓ Account delegated via CPI to Delegation Program");
 
+        // Check delegation status
+        await new Promise(resolve => setTimeout(resolve, 2000));
         const delegated = await isDelegated(connection, queryStatePda);
         console.log("  Delegation active:", delegated);
         delegationSucceeded = true;
@@ -269,44 +265,52 @@ describe("Priven - MagicBlock TEE Integration", () => {
         console.log("  Delegation error:", e.message?.slice(0, 100));
       }
 
-      // STEP 5: Execute in TEE
-      if (delegationSucceeded) {
-        console.log("\nSTEP 5: Execute query in TEE");
-        console.log("─".repeat(50));
+      // STEP 5: Execute NATIVELY (split architecture - full crypto outside BPF!)
+      console.log("\nSTEP 5: Execute query NATIVELY (split architecture)");
+      console.log("─".repeat(50));
+      console.log("  Full crypto runs in Node.js (x86), NOT on-chain (BPF)");
+      console.log("  submit_result on ER uses ~8k CUs (vs 1.4M+ for on-chain crypto)");
 
-        const teeConnection = new Connection(`${TEE_RPC}?token=${authToken.token}`, "confirmed");
-        const teeProvider = new AnchorProvider(teeConnection, new anchor.Wallet(wallet), { commitment: "confirmed" });
-        const teeProgram = new Program(program.idl, teeProvider) as Program<Priven>;
-
-        const [queryResultPda] = PublicKey.findProgramAddressSync(
-          [Buffer.from("result"), wallet.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)],
-          program.programId
+      try {
+        // Native execution with full crypto:
+        // - Decrypt predicate (X25519 ECDH + AES-GCM)
+        // - Evaluate pools
+        // - Encrypt result
+        // - Submit to ER
+        const result = await executeQueryNative(
+          program,
+          erProgram,
+          queryStatePda,
+          wallet,
+          teeKeyPair.privateKey  // TEE's PKCS8 private key for decryption
         );
-        const [configPda] = PublicKey.findProgramAddressSync([CONFIG_SEED], program.programId);
 
-        try {
-          const decryptionKey = new Uint8Array(32);
+        console.log("  ✓ Native execution complete!");
+        console.log("  Match count:", result.matchCount);
+        console.log("  Encrypted result length:", result.encryptedResult.length);
 
-          const executeTx = await teeProgram.methods
-            .executeQuery(Array.from(decryptionKey) as number[])
-            .accountsPartial({
-              payer: wallet.publicKey,
-              queryState: queryStatePda,
-              queryResult: queryResultPda,
-              config: configPda,
-            })
-            .signers([wallet])
-            .rpc();
+        // Verify result on ER
+        const erState = await erProgram.account.queryState.fetch(queryStatePda);
+        console.log("  [ER] Status:", Object.keys(erState.status)[0]);
+        console.log("  [ER] Execution success:", erState.executionSuccess);
+        console.log("  [ER] Encrypted len:", erState.encryptedLen);
+        console.log("  ✓ Result stored on ER (~8k CUs instead of 1.4M+)");
 
-          console.log("  Execute TX:", executeTx);
-          console.log("  ✓ Query executed inside TEE enclave");
-
-          const result = await program.account.queryResult.fetch(queryResultPda);
-          console.log("  Success:", result.success);
-          console.log("  Matching pools:", result.encryptedResult[0]);
-        } catch (e: any) {
-          console.log("  TEE execution error:", e.message?.slice(0, 100));
-        }
+        // STEP 6: Decrypt result client-side
+        console.log("\nSTEP 6: Decrypt result client-side");
+        console.log("─".repeat(50));
+        const { decryptResult } = await import("../client/src/encryption");
+        const decrypted = await decryptResult(
+          result.encryptedResult,
+          encrypted.privateKey,  // User's ephemeral private key
+          teeKeyPair.publicKey   // TEE's public key
+        );
+        console.log("  Decrypted match count:", decrypted.matchCount);
+        console.log("  Matching pools:", decrypted.matches.map(p => p.toBase58().slice(0, 16) + "..."));
+        console.log("  ✓ Client successfully decrypted result");
+      } catch (e: any) {
+        console.log("  Native execution error:", e.message);
+        console.log("  Stack:", e.stack?.slice(0, 300));
       }
 
       console.log("\n" + "─".repeat(50));

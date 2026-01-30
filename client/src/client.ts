@@ -238,7 +238,8 @@ export class PrivenClient {
   }
 
   /**
-   * Execute query in TEE
+   * Execute query in TEE using stateless mode (Magic Actions)
+   * Result is stored in QueryState for commit + action
    */
   private async executeInTee(
     queryId: BN,
@@ -268,12 +269,11 @@ export class PrivenClient {
       teeProvider
     );
 
-    // Execute in TEE
+    // Execute in TEE using stateless mode - result stored in QueryState
     const tx = await teeProgram.methods
-      .executeQuery(Array.from(decryptionKey.slice(0, 32)) as number[])
+      .executeQueryStateless(Array.from(decryptionKey.slice(0, 32)) as number[])
       .accounts({
-        teeValidator: TEE_VALIDATORS.TEE,
-        payer: this.wallet.publicKey,
+        caller: this.wallet.publicKey,
       })
       .signers([this.wallet])
       .rpc();
@@ -282,9 +282,10 @@ export class PrivenClient {
   }
 
   /**
-   * Commit result back to L1
+   * Commit result back to L1 using Magic Actions
+   * This schedules: commit QueryState + write_result_action (creates QueryResult on L1)
    */
-  private async commitResult(queryId: BN): Promise<string> {
+  private async commitResult(_queryId: BN): Promise<string> {
     if (!this.teeSession) {
       throw new Error("TEE session not initialized");
     }
@@ -305,8 +306,9 @@ export class PrivenClient {
       teeProvider
     );
 
+    // Use Magic Actions: commit + write_result_action atomically
     const tx = await teeProgram.methods
-      .commitResult()
+      .commitAndWriteResult()
       .accounts({
         payer: this.wallet.publicKey,
       })

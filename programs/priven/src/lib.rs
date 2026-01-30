@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
-use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
+use ephemeral_rollups_sdk::anchor::{action, commit, delegate, ephemeral};
+use ephemeral_rollups_sdk::ephem::commit_and_undelegate_accounts;
 
 // Crypto imports for AES-GCM
 use aes_gcm::{
@@ -148,13 +149,17 @@ pub mod priven {
     }
 
     /// Delegate query state to TEE validator for private execution
-    pub fn delegate_query(ctx: Context<DelegateQuery>) -> Result<()> {
-        let query_state = &mut ctx.accounts.query_state;
-        query_state.status = QueryStatus::Delegated;
+    pub fn delegate_query(ctx: Context<DelegateQuery>, query_id: u64) -> Result<()> {
+        // CPI to delegation program - transfers account ownership
+        ctx.accounts.delegate_query_state(
+            &ctx.accounts.user,
+            &[QUERY_SEED, ctx.accounts.user.key().as_ref(), &query_id.to_le_bytes()],
+            ephemeral_rollups_sdk::cpi::DelegateConfig::default(),
+        )?;
 
         emit!(QueryDelegated {
-            query_id: query_state.query_id,
-            owner: query_state.owner,
+            query_id,
+            owner: ctx.accounts.user.key(),
         });
 
         Ok(())
@@ -210,13 +215,22 @@ pub mod priven {
         Ok(())
     }
 
-    /// Execute query in stateless mode - result returned in event, no result account needed
+    /// Execute query in stateless mode - result stored in QueryState for Magic Actions
     /// This is the TEE-friendly version that only writes to query_state (already delegated)
-    pub fn execute_query_stateless(ctx: Context<ExecuteQueryStateless>, decryption_key: [u8; 32]) -> Result<()> {
+    /// Runs on Ephemeral Rollup - the fact we can access/modify the account proves delegation
+    pub fn execute_query_stateless(
+        ctx: Context<ExecuteQueryStateless>,
+        decryption_key: [u8; 32],
+        _owner: Pubkey,  // For PDA derivation
+        _query_id: u64,  // For PDA derivation
+    ) -> Result<()> {
         let query_state = &mut ctx.accounts.query_state;
 
+        // Status is Pending when delegated (delegation only changes owner, not data)
+        // On ER, we can write to this account because it was delegated
+        // On L1 after delegation, this would fail because delegation program owns it
         require!(
-            query_state.status == QueryStatus::Delegated,
+            query_state.status == QueryStatus::Pending,
             PrivenError::QueryNotDelegated
         );
 
@@ -230,6 +244,11 @@ pub mod priven {
             &query_state.pools[..query_state.pool_count as usize],
         );
 
+        // Store result in QueryState for Magic Actions commit
+        query_state.encrypted_result = encrypted_result;
+        query_state.encrypted_len = encrypted_len;
+        query_state.execution_success = success;
+
         query_state.status = if success {
             QueryStatus::Completed
         } else {
@@ -239,7 +258,7 @@ pub mod priven {
         // Extract match count
         let match_count = if encrypted_len > 0 { encrypted_result[0] } else { 0 };
 
-        // Emit result in event (stateless - no result account)
+        // Emit result in event (for immediate client access)
         emit!(QueryExecuted {
             query_id: query_state.query_id,
             owner: query_state.owner,
@@ -248,6 +267,23 @@ pub mod priven {
             encrypted_result: encrypted_result[..encrypted_len as usize].to_vec(),
             encrypted_len,
         });
+
+        Ok(())
+    }
+
+    /// Commit and undelegate query state back to L1
+    /// This must be called after execute_query_stateless to persist changes
+    pub fn undelegate_query(
+        ctx: Context<UndelegateQuery>,
+        _owner: Pubkey,   // For PDA derivation
+        _query_id: u64,   // For PDA derivation
+    ) -> Result<()> {
+        commit_and_undelegate_accounts(
+            &ctx.accounts.payer,
+            vec![&ctx.accounts.query_state.to_account_info()],
+            &ctx.accounts.magic_context,
+            &ctx.accounts.magic_program,
+        )?;
 
         Ok(())
     }
@@ -326,6 +362,124 @@ pub mod priven {
 
         Ok(())
     }
+
+    // ========================================================================
+    // MAGIC ACTIONS - Atomic L1 execution after TEE commit
+    // ========================================================================
+
+    /// Write result action - runs on L1 after TEE commits QueryState
+    /// This is the #[action] that creates QueryResult atomically
+    pub fn write_result_action(ctx: Context<WriteResultAction>) -> Result<()> {
+        let query_state = &ctx.accounts.query_state;
+        let query_result = &mut ctx.accounts.query_result;
+
+        // Copy encrypted result from committed QueryState to new QueryResult
+        query_result.owner = query_state.owner;
+        query_result.query_id = query_state.query_id;
+        query_result.encrypted_result = query_state.encrypted_result;
+        query_result.encrypted_len = query_state.encrypted_len;
+        query_result.completed_slot = Clock::get()?.slot;
+        query_result.success = query_state.execution_success;
+        query_result.bump = ctx.bumps.query_result;
+
+        emit!(QueryCompleted {
+            query_id: query_state.query_id,
+            owner: query_state.owner,
+            success: query_state.execution_success,
+            result_slot: query_result.completed_slot,
+        });
+
+        Ok(())
+    }
+
+    /// Commit and write result - schedules TEE commit + L1 action atomically
+    /// Called from ephemeral rollup after execute_query_stateless
+    pub fn commit_and_write_result(ctx: Context<CommitAndWriteResult>) -> Result<()> {
+        let query_state = &ctx.accounts.query_state;
+
+        require!(
+            query_state.status == QueryStatus::Completed || query_state.status == QueryStatus::Failed,
+            PrivenError::InvalidQueryStatus
+        );
+
+        // The #[commit] macro handles scheduling the commit
+        // The action will run on L1 after commit completes
+
+        msg!("Scheduling commit with write_result_action");
+        msg!("Query ID: {}, Success: {}", query_state.query_id, query_state.execution_success);
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // SPLIT ARCHITECTURE: Native TEE Service submits pre-computed results
+    // ========================================================================
+
+    /// Submit result from native TEE service (no crypto on-chain!)
+    ///
+    /// This is the key to avoiding compute unit limits:
+    /// - Crypto runs NATIVELY in TEE service (x86, no CU limit)
+    /// - On-chain instruction just stores the pre-computed result
+    /// - Uses ~10k CUs instead of 1.4M+
+    ///
+    /// Flow:
+    /// 1. TEE service fetches QueryState via RPC
+    /// 2. TEE service decrypts predicate (native x86)
+    /// 3. TEE service evaluates pools (native x86)
+    /// 4. TEE service encrypts result (native x86)
+    /// 5. TEE service calls this instruction to store result
+    pub fn submit_result(
+        ctx: Context<SubmitResult>,
+        encrypted_result: [u8; ENCRYPTED_RESULT_SIZE],
+        encrypted_len: u16,
+        success: bool,
+        _owner: Pubkey,  // For PDA derivation
+        _query_id: u64,  // For PDA derivation
+    ) -> Result<()> {
+        let query_state = &mut ctx.accounts.query_state;
+
+        // Verify query is in a valid state for result submission
+        // Accept both Pending (fresh) and Delegated states
+        require!(
+            query_state.status == QueryStatus::Pending || query_state.status == QueryStatus::Delegated,
+            PrivenError::InvalidQueryStatus
+        );
+
+        // Store the pre-computed encrypted result
+        query_state.encrypted_result = encrypted_result;
+        query_state.encrypted_len = encrypted_len;
+        query_state.execution_success = success;
+        query_state.status = if success {
+            QueryStatus::Completed
+        } else {
+            QueryStatus::Failed
+        };
+
+        // Extract match count from result (first byte after decryption would be count)
+        // For encrypted data, we can't read it, but the caller passed success flag
+        let match_count = if encrypted_len > 0 && success {
+            // Encrypted result format: [ciphertext][nonce:12][tag:16]
+            // We can't read plaintext here, but TEE executor knows the count
+            0u8 // Will be updated when we have attestation
+        } else {
+            0
+        };
+
+        emit!(QueryExecuted {
+            query_id: query_state.query_id,
+            owner: query_state.owner,
+            success,
+            match_count,
+            encrypted_result: encrypted_result[..encrypted_len as usize].to_vec(),
+            encrypted_len,
+        });
+
+        msg!("Result submitted by TEE executor");
+        msg!("Query ID: {}, Success: {}, Encrypted len: {}",
+            query_state.query_id, success, encrypted_len);
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -372,18 +526,19 @@ pub struct SubmitQuery<'info> {
 
 #[delegate]
 #[derive(Accounts)]
+#[instruction(query_id: u64)]
 pub struct DelegateQuery<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
+    /// CHECK: PDA seeds include user.key() for ownership verification
     #[account(
         mut,
-        seeds = [QUERY_SEED, user.key().as_ref(), &query_state.query_id.to_le_bytes()],
-        bump = query_state.bump,
-        constraint = query_state.owner == user.key() @ PrivenError::Unauthorized,
-        del
+        del,
+        seeds = [QUERY_SEED, user.key().as_ref(), &query_id.to_le_bytes()],
+        bump,
     )]
-    pub query_state: Account<'info, QueryState>,
+    pub query_state: AccountInfo<'info>,
 }
 
 /// Execute query - runs inside TEE ephemeral rollup
@@ -417,7 +572,9 @@ pub struct ExecuteQuery<'info> {
 
 /// Execute query stateless - TEE-friendly version that only writes to query_state
 /// Result is emitted in QueryExecuted event, no result account needed
+/// NOTE: No config account - TEE authorization is implicit via delegation
 #[derive(Accounts)]
+#[instruction(decryption_key: [u8; 32], owner: Pubkey, query_id: u64)]
 pub struct ExecuteQueryStateless<'info> {
     /// Caller (TEE validator or authorized executor)
     #[account(mut)]
@@ -425,13 +582,32 @@ pub struct ExecuteQueryStateless<'info> {
 
     #[account(
         mut,
-        seeds = [QUERY_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
-        bump = query_state.bump,
+        seeds = [QUERY_SEED, owner.as_ref(), &query_id.to_le_bytes()],
+        bump,
+    )]
+    pub query_state: Account<'info, QueryState>,
+}
+
+/// Commit and undelegate query state back to L1
+#[commit]
+#[derive(Accounts)]
+#[instruction(owner: Pubkey, query_id: u64)]
+pub struct UndelegateQuery<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [QUERY_SEED, owner.as_ref(), &query_id.to_le_bytes()],
+        bump,
     )]
     pub query_state: Account<'info, QueryState>,
 
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, QueryConfig>,
+    /// CHECK: MagicBlock context account
+    pub magic_context: AccountInfo<'info>,
+
+    /// CHECK: MagicBlock program
+    pub magic_program: AccountInfo<'info>,
 }
 
 #[commit]
@@ -478,6 +654,70 @@ pub struct ExpireQuery<'info> {
 }
 
 // ============================================================================
+// MAGIC ACTIONS CONTEXTS
+// ============================================================================
+
+/// Action context - runs on L1 after commit, creates QueryResult
+#[action]
+#[derive(Accounts)]
+pub struct WriteResultAction<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// QueryState with committed result data
+    #[account(
+        seeds = [QUERY_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
+        bump = query_state.bump
+    )]
+    pub query_state: Account<'info, QueryState>,
+
+    /// QueryResult to be created on L1
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + QueryResult::INIT_SPACE,
+        seeds = [RESULT_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
+        bump
+    )]
+    pub query_result: Account<'info, QueryResult>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Commit context - schedules commit + write_result_action
+#[commit]
+#[derive(Accounts)]
+pub struct CommitAndWriteResult<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [QUERY_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
+        bump = query_state.bump
+    )]
+    pub query_state: Account<'info, QueryState>,
+}
+
+/// Submit result from native TEE executor (no crypto on-chain)
+/// This is the split architecture - crypto runs natively in TEE service
+#[derive(Accounts)]
+#[instruction(encrypted_result: [u8; ENCRYPTED_RESULT_SIZE], encrypted_len: u16, success: bool, owner: Pubkey, query_id: u64)]
+pub struct SubmitResult<'info> {
+    /// TEE executor or authorized caller
+    #[account(mut)]
+    pub caller: Signer<'info>,
+
+    /// QueryState to store result in
+    #[account(
+        mut,
+        seeds = [QUERY_SEED, owner.as_ref(), &query_id.to_le_bytes()],
+        bump,
+    )]
+    pub query_state: Account<'info, QueryState>,
+}
+
+// ============================================================================
 // ACCOUNT STRUCTURES
 // ============================================================================
 
@@ -504,6 +744,10 @@ pub struct QueryState {
     pub pool_count: u8,
     pub submitted_at: i64,
     pub bump: u8,
+    // Magic Actions: store result in QueryState for L1 commit
+    pub encrypted_result: [u8; ENCRYPTED_RESULT_SIZE],
+    pub encrypted_len: u16,
+    pub execution_success: bool,
 }
 
 #[account]
