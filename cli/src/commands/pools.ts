@@ -9,9 +9,7 @@
 import { Command } from "commander";
 import { Connection, PublicKey } from "@solana/web3.js";
 import chalk from "chalk";
-import type { TokenAccountData, PoolData } from "@priven/client";
-import { loadConfig } from "../config";
-import { loadWallet } from "../utils/wallet";
+import type { PoolData } from "@priven/client";
 import {
   outputPools,
   outputError,
@@ -25,8 +23,6 @@ import { createSpinner } from "../utils/progress";
 
 interface PoolsListOptions {
   rpcUrl?: string;
-  wallet?: string;
-  network?: "devnet" | "mainnet";
   minTvl?: string;
   limit?: string;
   output?: OutputFormat;
@@ -39,7 +35,6 @@ interface PoolsGetOptions {
 
 interface PoolsStatsOptions {
   rpcUrl?: string;
-  network?: "devnet" | "mainnet";
 }
 
 export function registerPoolsCommand(program: Command): void {
@@ -49,10 +44,8 @@ export function registerPoolsCommand(program: Command): void {
 
   pools
     .command("list")
-    .description("List available pools")
-    .option("--rpc-url <url>", "Solana RPC URL")
-    .option("--wallet <path>", "Path to wallet keypair (for token accounts)")
-    .option("--network <network>", "Network: devnet or mainnet", "devnet")
+    .description("List Raydium V4 pools from mainnet")
+    .option("--rpc-url <url>", "Mainnet RPC URL (default: QuickNode)")
     .option("--min-tvl <lamports>", "Minimum TVL filter")
     .option("--limit <n>", "Maximum number of pools to show", "20")
     .option("--output <format>", "Output format: json or table", "table")
@@ -71,9 +64,8 @@ export function registerPoolsCommand(program: Command): void {
 
   pools
     .command("stats")
-    .description("Show pool statistics")
-    .option("--rpc-url <url>", "Solana RPC URL")
-    .option("--network <network>", "Network: devnet or mainnet", "devnet")
+    .description("Show Raydium pool statistics from mainnet")
+    .option("--rpc-url <url>", "Mainnet RPC URL (default: QuickNode)")
     .action(async (options: PoolsStatsOptions) => {
       await showPoolStats(options);
     });
@@ -83,16 +75,13 @@ async function listPools(options: PoolsListOptions): Promise<void> {
   const spinner = createSpinner("Fetching pools...");
 
   try {
-    const config = await loadConfig();
-    const network = options.network || config.network;
     const limit = parseInt(options.limit || "20");
     const minTvl = options.minTvl ? BigInt(options.minTvl) : 0n;
     const outputFormat = (options.output || "table") as OutputFormat;
 
     console.log();
-    console.log(chalk.bold("Pool Discovery"));
+    console.log(chalk.bold("Raydium Pool Discovery (Mainnet)"));
     console.log(chalk.gray("─".repeat(50)));
-    console.log(`  Network:     ${chalk.cyan(network)}`);
     if (minTvl > 0n) {
       console.log(`  Min TVL:     ${chalk.yellow(formatNumber(minTvl))}`);
     }
@@ -102,82 +91,44 @@ async function listPools(options: PoolsListOptions): Promise<void> {
 
     spinner.start();
 
-    let pools: PoolDisplay[] = [];
+    const rpcUrl =
+      options.rpcUrl ||
+      process.env.QUICKNODE_MAINNET_RPC ||
+      "https://api.mainnet-beta.solana.com";
 
-    if (network === "devnet") {
-      // On devnet, fetch token accounts from wallet
-      const rpcUrl = options.rpcUrl || config.rpcUrl;
-      const walletPath = options.wallet || config.wallet;
+    const connection = new Connection(rpcUrl, "confirmed");
 
-      const connection = new Connection(rpcUrl, "confirmed");
-      const wallet = loadWallet(walletPath);
+    spinner.text = "Fetching Raydium V4 pools...";
 
-      spinner.text = `Fetching token accounts for ${wallet.publicKey.toBase58().slice(0, 8)}...`;
+    const { fetchRaydiumPoolsWithRetry, calculateTVL } = await import("@priven/client");
+    const raydiumPools = await fetchRaydiumPoolsWithRetry(connection, {
+      status: 6,
+      minTvlPrefilter: minTvl,
+    });
 
-      const { fetchTokenAccountsByOwner } = await import("@priven/client");
-      const accounts = await fetchTokenAccountsByOwner(connection, wallet.publicKey);
+    raydiumPools.sort((a: PoolData, b: PoolData) => {
+      const tvlA = calculateTVL(a);
+      const tvlB = calculateTVL(b);
+      if (tvlB > tvlA) return 1;
+      if (tvlB < tvlA) return -1;
+      return 0;
+    });
 
-      const filteredAccounts = accounts
-        .filter((a: TokenAccountData) => a.balance >= minTvl)
-        .sort((a: TokenAccountData, b: TokenAccountData) => {
-          // Sort by balance descending
-          if (b.balance > a.balance) return 1;
-          if (b.balance < a.balance) return -1;
-          return 0;
-        })
-        .slice(0, limit);
+    const pools: PoolDisplay[] = raydiumPools.slice(0, limit).map((p: PoolData) => {
+      const tvl = BigInt(p.tokenAReserve.toString()) + BigInt(p.tokenBReserve.toString());
+      return {
+        address: p.address.toBase58(),
+        tvl: formatNumber(tvl),
+        tokenAReserve: formatNumber(BigInt(p.tokenAReserve.toString())),
+        tokenBReserve: formatNumber(BigInt(p.tokenBReserve.toString())),
+      };
+    });
 
-      pools = filteredAccounts.map((a: TokenAccountData) => ({
-        address: a.address.toBase58(),
-        tvl: formatNumber(a.balance),
-        tokenAReserve: formatNumber(a.balance),
-        tokenBReserve: "0",
-      }));
-
-      spinner.succeed(`Found ${accounts.length} token accounts (showing ${pools.length})`);
-    } else {
-      // On mainnet, fetch Raydium pools with retry
-      const rpcUrl =
-        options.rpcUrl ||
-        process.env.QUICKNODE_MAINNET_RPC ||
-        "https://api.mainnet-beta.solana.com";
-
-      const connection = new Connection(rpcUrl, "confirmed");
-
-      spinner.text = "Fetching Raydium V4 pools (with retry)...";
-
-      const { fetchRaydiumPoolsWithRetry, calculateTVL } = await import("@priven/client");
-      const raydiumPools = await fetchRaydiumPoolsWithRetry(connection, {
-        status: 1, // Only active pools
-        minTvlPrefilter: minTvl,
-      });
-
-      // Sort by TVL descending
-      raydiumPools.sort((a: PoolData, b: PoolData) => {
-        const tvlA = calculateTVL(a);
-        const tvlB = calculateTVL(b);
-        if (tvlB > tvlA) return 1;
-        if (tvlB < tvlA) return -1;
-        return 0;
-      });
-
-      pools = raydiumPools.slice(0, limit).map((p: PoolData) => {
-        const tvl = BigInt(p.tokenAReserve.toString()) + BigInt(p.tokenBReserve.toString());
-        return {
-          address: p.address.toBase58(),
-          tvl: formatNumber(tvl),
-          tokenAReserve: formatNumber(BigInt(p.tokenAReserve.toString())),
-          tokenBReserve: formatNumber(BigInt(p.tokenBReserve.toString())),
-        };
-      });
-
-      spinner.succeed(`Found ${raydiumPools.length} active Raydium pools (showing ${pools.length})`);
-    }
+    spinner.succeed(`Found ${raydiumPools.length} active Raydium pools (showing ${pools.length})`);
 
     console.log();
     outputPools(pools, outputFormat);
 
-    // Summary
     if (pools.length > 0) {
       console.log();
       console.log(chalk.gray(`Use 'priven pools get <address>' for detailed info`));
@@ -197,8 +148,7 @@ async function getPool(address: string, options: PoolsGetOptions): Promise<void>
   const spinner = createSpinner("Fetching pool info...");
 
   try {
-    const config = await loadConfig();
-    const rpcUrl = options.rpcUrl || config.rpcUrl;
+    const rpcUrl = options.rpcUrl || process.env.QUICKNODE_MAINNET_RPC || "https://api.mainnet-beta.solana.com";
     const outputFormat = (options.output || "table") as OutputFormat;
 
     // Validate address
@@ -292,84 +242,48 @@ async function showPoolStats(options: PoolsStatsOptions): Promise<void> {
   const spinner = createSpinner("Gathering pool statistics...");
 
   try {
-    const config = await loadConfig();
-    const network = options.network || config.network;
-
     console.log();
-    console.log(chalk.bold("Pool Statistics"));
-    console.log(chalk.gray("─".repeat(50)));
-    console.log(`  Network:     ${chalk.cyan(network)}`);
+    console.log(chalk.bold("Raydium Pool Statistics (Mainnet)"));
     console.log(chalk.gray("─".repeat(50)));
     console.log();
 
     spinner.start();
 
-    if (network === "mainnet") {
-      const rpcUrl =
-        options.rpcUrl ||
-        process.env.QUICKNODE_MAINNET_RPC ||
-        "https://api.mainnet-beta.solana.com";
+    const rpcUrl =
+      options.rpcUrl ||
+      process.env.QUICKNODE_MAINNET_RPC ||
+      "https://api.mainnet-beta.solana.com";
 
-      const connection = new Connection(rpcUrl, "confirmed");
+    const connection = new Connection(rpcUrl, "confirmed");
 
-      spinner.text = "Fetching Raydium pools...";
+    spinner.text = "Fetching Raydium pools...";
 
-      const { fetchRaydiumPoolsWithRetry, calculateTVL, RAYDIUM_V4_PROGRAM_ID } = await import("@priven/client");
-      const pools = await fetchRaydiumPoolsWithRetry(connection, { status: 1 });
+    const { fetchRaydiumPoolsWithRetry, calculateTVL, RAYDIUM_V4_PROGRAM_ID } = await import("@priven/client");
+    const pools = await fetchRaydiumPoolsWithRetry(connection, { status: 6 });
 
-      // Calculate statistics
-      let totalTvl = 0n;
-      let minPoolTvl = BigInt(Number.MAX_SAFE_INTEGER);
-      let maxPoolTvl = 0n;
+    let totalTvl = 0n;
+    let minPoolTvl = BigInt(Number.MAX_SAFE_INTEGER);
+    let maxPoolTvl = 0n;
 
-      for (const pool of pools) {
-        const tvl = calculateTVL(pool);
-        totalTvl += tvl;
-        if (tvl < minPoolTvl) minPoolTvl = tvl;
-        if (tvl > maxPoolTvl) maxPoolTvl = tvl;
-      }
-
-      const avgTvl = pools.length > 0 ? totalTvl / BigInt(pools.length) : 0n;
-
-      spinner.succeed("Statistics gathered");
-      console.log();
-
-      console.log(chalk.bold("  Raydium V4 Statistics:"));
-      console.log(`    ${chalk.cyan("Program ID:")}    ${RAYDIUM_V4_PROGRAM_ID.toBase58()}`);
-      console.log(`    ${chalk.cyan("Total Pools:")}   ${chalk.green(pools.length.toLocaleString())}`);
-      console.log(`    ${chalk.cyan("Total TVL:")}     ${chalk.green(formatNumber(totalTvl))}`);
-      console.log(`    ${chalk.cyan("Average TVL:")}   ${formatNumber(avgTvl)}`);
-      console.log(`    ${chalk.cyan("Min Pool TVL:")} ${formatNumber(minPoolTvl)}`);
-      console.log(`    ${chalk.cyan("Max Pool TVL:")} ${formatNumber(maxPoolTvl)}`);
-    } else {
-      // Devnet - show token account stats
-      const rpcUrl = options.rpcUrl || config.rpcUrl;
-      const walletPath = config.wallet;
-
-      const connection = new Connection(rpcUrl, "confirmed");
-      const wallet = loadWallet(walletPath);
-
-      spinner.text = "Fetching token accounts...";
-
-      const { fetchTokenAccountsByOwner, TOKEN_PROGRAM_ID } = await import("@priven/client");
-      const accounts = await fetchTokenAccountsByOwner(connection, wallet.publicKey);
-
-      let totalBalance = 0n;
-      for (const account of accounts) {
-        totalBalance += account.balance;
-      }
-
-      spinner.succeed("Statistics gathered");
-      console.log();
-
-      console.log(chalk.bold("  Token Account Statistics:"));
-      console.log(`    ${chalk.cyan("Wallet:")}         ${wallet.publicKey.toBase58().slice(0, 20)}...`);
-      console.log(`    ${chalk.cyan("Token Program:")}  ${TOKEN_PROGRAM_ID.toBase58()}`);
-      console.log(`    ${chalk.cyan("Total Accounts:")} ${chalk.green(accounts.length.toLocaleString())}`);
-      console.log(`    ${chalk.cyan("Total Balance:")}  ${chalk.green(formatNumber(totalBalance))}`);
-
-      outputInfo("Note: Devnet uses token accounts as mock pools for testing");
+    for (const pool of pools) {
+      const tvl = calculateTVL(pool);
+      totalTvl += tvl;
+      if (tvl < minPoolTvl) minPoolTvl = tvl;
+      if (tvl > maxPoolTvl) maxPoolTvl = tvl;
     }
+
+    const avgTvl = pools.length > 0 ? totalTvl / BigInt(pools.length) : 0n;
+
+    spinner.succeed("Statistics gathered");
+    console.log();
+
+    console.log(chalk.bold("  Raydium V4 Statistics:"));
+    console.log(`    ${chalk.cyan("Program ID:")}    ${RAYDIUM_V4_PROGRAM_ID.toBase58()}`);
+    console.log(`    ${chalk.cyan("Total Pools:")}   ${chalk.green(pools.length.toLocaleString())}`);
+    console.log(`    ${chalk.cyan("Total TVL:")}     ${chalk.green(formatNumber(totalTvl))}`);
+    console.log(`    ${chalk.cyan("Average TVL:")}   ${formatNumber(avgTvl)}`);
+    console.log(`    ${chalk.cyan("Min Pool TVL:")} ${formatNumber(minPoolTvl)}`);
+    console.log(`    ${chalk.cyan("Max Pool TVL:")} ${formatNumber(maxPoolTvl)}`);
 
     console.log();
   } catch (error: any) {

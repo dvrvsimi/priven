@@ -150,11 +150,8 @@ export interface QueryResult {
  * Options for configuring query execution
  */
 export interface QueryOptions {
-  /** QuickNode RPC endpoint URL */
-  rpcUrl?: string;
-
-  /** Transaction confirmation commitment level */
-  commitment?: Commitment;
+  /** Mainnet RPC for fetching Raydium pools */
+  mainnetRpc?: string;
 
   /** Maximum number of pools to query (default: 5) */
   maxPools?: number;

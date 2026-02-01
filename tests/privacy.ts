@@ -125,14 +125,13 @@ describe("Priven - Privacy Claims", () => {
       this.timeout(30000);
       console.log("\n=== Encrypt/Decrypt Roundtrip Test ===");
 
-      const { encryptPredicate, generateKeyPair } = await import("../client/src/encryption");
+      const { encryptPredicate, generateKeyPair, createTvlPredicate } = await import("../client/src/encryption");
+      const { testDecryptPredicate } = await import("./helpers");
 
       const teeKeyPair = await generateKeyPair();
 
-      const originalPredicate = {
-        minTvl: BigInt(1_000_000),
-        maxTvl: BigInt(10_000_000),
-      };
+      // Use V2 predicate format (with version byte)
+      const originalPredicate = createTvlPredicate(BigInt(1_000_000), BigInt(10_000_000));
 
       const encrypted = await encryptPredicate(originalPredicate, teeKeyPair.publicKey);
 
@@ -141,27 +140,36 @@ describe("Priven - Privacy Claims", () => {
       console.log("User publicKey length:", encrypted.publicKey.length, "bytes");
       console.log("User privateKey length:", encrypted.privateKey.length, "bytes (PKCS8)");
 
-      const ct = encrypted.ciphertext.slice(0, 16);
-      const nonce = encrypted.ciphertext.slice(16, 28);
-      const tag = encrypted.ciphertext.slice(28, 44);
+      // V2 predicates have variable-length ciphertext: [data][nonce:12][tag:16]
+      const dataLen = encrypted.ciphertext.length - 28;
+      const ct = encrypted.ciphertext.slice(0, dataLen);
+      const nonce = encrypted.ciphertext.slice(dataLen, dataLen + 12);
+      const tag = encrypted.ciphertext.slice(dataLen + 12);
 
-      console.log("Ciphertext:", Buffer.from(ct).toString("hex"));
+      console.log("Ciphertext (data):", Buffer.from(ct).toString("hex").slice(0, 32) + "...");
       console.log("Nonce:", Buffer.from(nonce).toString("hex"));
       console.log("Tag:", Buffer.from(tag).toString("hex"));
 
-      expect(ct.length).to.equal(16);
       expect(nonce.length).to.equal(12);
       expect(tag.length).to.equal(16);
 
-      const plainBytes = new Uint8Array(16);
-      const view = new DataView(plainBytes.buffer);
-      view.setBigUint64(0, originalPredicate.minTvl, true);
-      view.setBigUint64(8, originalPredicate.maxTvl, true);
+      // ACTUAL DECRYPTION VERIFICATION
+      const decrypted = await testDecryptPredicate(
+        encrypted.ciphertext,
+        teeKeyPair.privateKey,
+        encrypted.publicKey
+      );
 
-      expect(Buffer.from(ct).toString("hex")).to.not.equal(Buffer.from(plainBytes).toString("hex"));
+      expect(decrypted.version).to.equal(2);
+      expect(decrypted.filters).to.have.length(2);
+      expect(decrypted.filters[0].value).to.equal(originalPredicate.filters[0].value);
+      expect(decrypted.filters[1].value).to.equal(originalPredicate.filters[1].value);
 
-      console.log("✓ Encryption produces valid ciphertext structure");
-      console.log("✓ Ciphertext differs from plaintext");
+      console.log("✓ Decrypted version:", decrypted.version);
+      console.log("✓ Decrypted filters:", decrypted.filters.length);
+      console.log("✓ Filter 0 (TVL >= 1M):", decrypted.filters[0].value.toString());
+      console.log("✓ Filter 1 (TVL <= 10M):", decrypted.filters[1].value.toString());
+      console.log("✓ Roundtrip encryption/decryption verified");
     });
 
     it("different users cannot decrypt each other's predicates", async function () {

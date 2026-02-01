@@ -25,11 +25,24 @@ import {
 } from "../utils/output";
 import { createSpinner } from "../utils/progress";
 
+/**
+ * Mask RPC URL to hide API keys (only show domain)
+ */
+function maskRpcUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return parsed.origin;
+  } catch {
+    return url.split("/")[0] + "//***";
+  }
+}
+
 interface QueryOptions {
   minTvl?: string;
   maxTvl?: string;
   filter?: string[];
   rpcUrl?: string;
+  mainnetRpc?: string;
   wallet?: string;
   programId?: string;
   maxPools?: string;
@@ -103,7 +116,7 @@ function collectFilters(value: string, previous: string[]): string[] {
 export function registerQueryCommand(program: Command): void {
   program
     .command("query")
-    .description("Execute a privacy-preserving pool query")
+    .description("Execute a privacy-preserving pool query (pools from mainnet, execution on devnet)")
     .option("--min-tvl <lamports>", "Minimum TVL threshold (V1 predicate, deprecated)")
     .option("--max-tvl <lamports>", "Maximum TVL threshold (V1 predicate, deprecated)")
     .option(
@@ -112,7 +125,8 @@ export function registerQueryCommand(program: Command): void {
       collectFilters,
       []
     )
-    .option("--rpc-url <url>", "Solana RPC URL (default: from config)")
+    .option("--rpc-url <url>", "Devnet RPC URL for query execution (default: from config)")
+    .option("--mainnet-rpc <url>", "Mainnet RPC URL for pool fetching (default: QuickNode)")
     .option("--wallet <path>", "Path to wallet keypair (default: from config)")
     .option("--program-id <pubkey>", "Priven program ID (default: from config)")
     .option("--max-pools <n>", "Maximum pools to include (default: 5)")
@@ -126,9 +140,9 @@ export function registerQueryCommand(program: Command): void {
 
 async function executeQuery(options: QueryOptions): Promise<void> {
   try {
-    // Load configuration
     const config = await loadConfig();
     const rpcUrl = options.rpcUrl || config.rpcUrl;
+    const mainnetRpc = options.mainnetRpc || process.env.QUICKNODE_MAINNET_RPC || "https://api.mainnet-beta.solana.com";
     const walletPath = options.wallet || config.wallet;
     const programId = options.programId || config.programId;
     const maxPools = parseInt(options.maxPools || String(config.defaultMaxPools));
@@ -193,13 +207,14 @@ async function executeQuery(options: QueryOptions): Promise<void> {
       console.log(chalk.yellow("\nNote: --min-tvl/--max-tvl is deprecated. Use --filter instead."));
     }
 
-    // Show configuration
     console.log();
     console.log(chalk.bold("Priven Private Query"));
     console.log(chalk.gray("─".repeat(50)));
-    console.log(`  RPC URL:     ${chalk.cyan(rpcUrl.slice(0, 50))}${rpcUrl.length > 50 ? "..." : ""}`);
+    console.log(`  Pool Data:   ${chalk.cyan("mainnet")} (Raydium V4)`);
+    console.log(`  Execution:   ${chalk.cyan("devnet")} (Priven program)`);
+    console.log(`  Mainnet RPC: ${chalk.gray(maskRpcUrl(mainnetRpc))}`);
+    console.log(`  Devnet RPC:  ${chalk.gray(maskRpcUrl(rpcUrl))}`);
     console.log(`  Program ID:  ${chalk.cyan(programId.slice(0, 20))}...`);
-    console.log(`  Network:     ${chalk.cyan(config.network)}`);
     console.log(`  Predicate:   ${chalk.yellow(predicateDescription)}`);
     for (const f of parsedFilters) {
       const typeName = Object.keys(FILTER_TYPES).find((k) => FILTER_TYPES[k] === f.type) || "?";
@@ -215,17 +230,14 @@ async function executeQuery(options: QueryOptions): Promise<void> {
       outputInfo("Dry run - no transactions will be submitted");
       console.log();
       console.log(chalk.bold("Query Flow:"));
-      console.log(`  ${chalk.cyan("1.")} Fetch pools from QuickNode RPC`);
-      console.log(`  ${chalk.cyan("2.")} Encrypt predicate with X25519 + AES-256-GCM`);
-      console.log(`  ${chalk.cyan("3.")} Submit encrypted query to Solana L1`);
-      console.log(`  ${chalk.cyan("4.")} Delegate QueryState to MagicBlock TEE`);
-      console.log(`  ${chalk.cyan("5.")} Execute query inside Intel TDX enclave`);
-      console.log(`  ${chalk.cyan("6.")} Commit result and decrypt locally`);
+      console.log(`  ${chalk.cyan("1.")} Fetch Raydium pools from mainnet`);
+      console.log(`  ${chalk.cyan("2.")} Encrypt predicate (X25519 + AES-256-GCM)`);
+      console.log(`  ${chalk.cyan("3.")} Submit encrypted query to devnet`);
+      console.log(`  ${chalk.cyan("4.")} Delegate to MagicBlock TEE`);
+      console.log(`  ${chalk.cyan("5.")} Execute in TEE (native crypto)`);
+      console.log(`  ${chalk.cyan("6.")} Decrypt result locally`);
       console.log();
-      console.log(chalk.gray("Privacy guarantees:"));
-      console.log(chalk.gray("  • Predicate encrypted - observers cannot see filter criteria"));
-      console.log(chalk.gray("  • TEE execution - decryption happens in hardware enclave"));
-      console.log(chalk.gray("  • Result encrypted - only you can decrypt matching pools"));
+      console.log(chalk.gray("Privacy: predicate encrypted, TEE execution, only you see results"));
       return;
     }
 
@@ -303,6 +315,7 @@ async function executeQuery(options: QueryOptions): Promise<void> {
       const matchingPools = await client.query(predicate, {
         maxPools,
         timeout,
+        mainnetRpc,
       });
 
       console.log();

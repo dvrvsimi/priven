@@ -46,7 +46,7 @@ export async function fetchRaydiumPools(
   ];
 
   // Optional: Filter by pool status (offset 0, 8 bytes for u64)
-  // status == 1 means active pool
+  // Raydium V4 uses status=6 for active pools
   // Note: Raydium stores status as u64, not u8
   if (filters?.status !== undefined) {
     // Encode status as u64 little-endian, then convert to base58
@@ -71,13 +71,15 @@ export async function fetchRaydiumPools(
   }
 
   try {
-    // Core QuickNode Integration: getProgramAccounts
-    // This fetches all accounts owned by the Raydium program
+    // Use dataSlice to only fetch the data we need (reduces response size dramatically)
+    // We need: status (0-8), lpReserve (720-728), swapBaseInAmount (256-264), swapQuoteInAmount (296-304)
+    // Fetch first 328 bytes which covers status through swapQuote2BaseFee
     const accounts = await connection.getProgramAccounts(
       RAYDIUM_V4_PROGRAM_ID,
       {
         filters: programFilters,
         commitment,
+        dataSlice: { offset: 0, length: 328 },
       }
     );
 
@@ -240,46 +242,30 @@ function parsePoolAccount(
   try {
     const data = accountInfo.data;
 
-    // Validate account size
-    if (data.length !== RAYDIUM_POOL_SIZE) {
-      console.warn(`Invalid pool account size: ${data.length} bytes`);
+    // Validate we have enough data (we use dataSlice so might be smaller than full size)
+    if (data.length < 328) {
       return null;
     }
 
     // Validate account owner
     if (!accountInfo.owner.equals(RAYDIUM_V4_PROGRAM_ID)) {
-      console.warn(
-        `Account owner mismatch: expected ${RAYDIUM_V4_PROGRAM_ID.toBase58()}, got ${accountInfo.owner.toBase58()}`
-      );
       return null;
     }
 
-    // Check pool status (must be active = 1)
+    // Check pool status
+    // Raydium V4 uses status=6 for active pools (not 1 as previously assumed)
     const status = data.readBigUInt64LE(RAYDIUM_V4_OFFSETS.status);
-    if (status !== 1n) {
-      // Skip inactive pools
+    if (status !== 6n) {
       return null;
     }
 
-    // Read swap amounts as a proxy for TVL
-    // swapBaseInAmount and swapQuoteOutAmount track cumulative volume
-    // For TVL, we'd ideally fetch vault balances, but for efficiency
-    // we use lpReserve as an indicator
-    const lpReserve = data.readBigUInt64LE(RAYDIUM_V4_OFFSETS.lpReserve);
-
-    // Read the actual swap amounts (u128, read as two u64s)
-    // swapBaseInAmount at offset 256 (16 bytes = u128)
+    // Read swap amounts as reserve approximation
     const swapBaseInLow = data.readBigUInt64LE(RAYDIUM_V4_OFFSETS.swapBaseInAmount);
-    // High bits available if needed: data.readBigUInt64LE(RAYDIUM_V4_OFFSETS.swapBaseInAmount + 8)
-
-    // swapQuoteInAmount at offset 296 (16 bytes = u128)
     const swapQuoteInLow = data.readBigUInt64LE(RAYDIUM_V4_OFFSETS.swapQuoteInAmount);
-    // High bits available if needed: data.readBigUInt64LE(RAYDIUM_V4_OFFSETS.swapQuoteInAmount + 8)
 
-    // Use the low 64 bits as reserve approximation (actual TVL requires vault fetch)
-    // For hackathon demo, this gives us meaningful non-zero values to filter on
-    const tokenAReserve = swapBaseInLow > 0n ? swapBaseInLow : lpReserve;
-    const tokenBReserve = swapQuoteInLow > 0n ? swapQuoteInLow : lpReserve;
+    // Use swap amounts as TVL proxy
+    const tokenAReserve = swapBaseInLow > 0n ? swapBaseInLow : 1n;
+    const tokenBReserve = swapQuoteInLow > 0n ? swapQuoteInLow : 1n;
 
     return {
       address: pubkey,

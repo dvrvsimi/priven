@@ -36,46 +36,51 @@ export function registerTeeCommand(program: Command): void {
 }
 
 async function verifyTee(options: TeeVerifyOptions): Promise<void> {
-  const spinner = createSpinner("Verifying TEE integrity...");
+  const spinner = createSpinner("Verifying TEE endpoint...");
 
   try {
     const config = await loadConfig();
     const network = options.network || config.network;
+    const { MAGICBLOCK_RPC, TEE_VALIDATORS } = await import("@priven/client");
+    const teeRpc = config.teeRpc || MAGICBLOCK_RPC.tee;
 
     console.log();
-    console.log(chalk.bold("TEE Integrity Verification"));
+    console.log(chalk.bold("TEE Endpoint Verification"));
     console.log(chalk.gray("─".repeat(50)));
     console.log(`  Network:     ${chalk.cyan(network)}`);
-    console.log(`  TEE RPC:     ${chalk.cyan(config.teeRpc)}`);
+    console.log(`  TEE RPC:     ${chalk.cyan(teeRpc)}`);
     console.log(chalk.gray("─".repeat(50)));
     console.log();
 
     spinner.start();
 
-    // Import TEE verification from SDK
-    const { verifyTeeRpcIntegrity } = await import("@magicblock-labs/ephemeral-rollups-sdk");
-    const { MAGICBLOCK_RPC, TEE_VALIDATORS } = await import("@priven/client");
+    // Fetch a TDX quote from the TEE endpoint
+    spinner.text = "Requesting TDX attestation quote...";
+    const challenge = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64");
+    const quoteUrl = `${teeRpc}/quote?challenge=${encodeURIComponent(challenge)}`;
 
-    const teeRpc = config.teeRpc || MAGICBLOCK_RPC.tee;
+    const response = await fetch(quoteUrl);
+    const data = await response.json() as { quote?: string; error?: string };
 
-    // Verify TEE integrity
-    const verified = await verifyTeeRpcIntegrity(teeRpc);
-
-    if (verified) {
-      spinner.succeed("TEE integrity verified (Intel TDX attestation passed)");
-      console.log();
-      outputSuccess("TEE is trustworthy");
-      console.log();
-      console.log(chalk.gray("  The TEE endpoint has been verified using Intel TDX remote attestation."));
-      console.log(chalk.gray("  Your encrypted predicates will be processed securely."));
-    } else {
-      spinner.warn("TEE integrity verification failed");
-      console.log();
-      outputWarning("TEE attestation could not be verified");
-      console.log();
-      console.log(chalk.yellow("  Warning: The TEE endpoint could not be verified."));
-      console.log(chalk.yellow("  Proceed with caution - your predicates may not be fully protected."));
+    if (response.status !== 200 || !data.quote) {
+      spinner.fail("TEE endpoint did not return a valid quote");
+      outputError(data.error || "No quote returned");
+      process.exit(1);
     }
+
+    // Quote received - endpoint is functional
+    const quoteBytes = Buffer.from(data.quote, "base64");
+    spinner.succeed("TEE endpoint is functional (TDX quote received)");
+
+    console.log();
+    outputSuccess("TEE endpoint verified");
+    console.log();
+    console.log(chalk.gray("  Quote size:  ") + chalk.cyan(`${quoteBytes.length} bytes`));
+    console.log(chalk.gray("  Challenge:   ") + chalk.cyan(challenge.slice(0, 20) + "..."));
+    console.log();
+    console.log(chalk.yellow("  Note: Full TDX attestation verification requires a browser environment."));
+    console.log(chalk.yellow("  The @phala/dcap-qvl-web library used for cryptographic verification"));
+    console.log(chalk.yellow("  is browser-only. Use the SDK in a browser for full verification."));
 
     // Show validator info
     console.log();

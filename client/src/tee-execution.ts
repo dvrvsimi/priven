@@ -10,7 +10,7 @@
  */
 
 import * as anchor from "@coral-xyz/anchor";
-import { Program, BN, AnchorProvider } from "@coral-xyz/anchor";
+import { Program, BN, AnchorProvider, Idl } from "@coral-xyz/anchor";
 import {
   PublicKey,
   Keypair,
@@ -129,7 +129,7 @@ export async function cloneAccountToEphemeral(
  * 2. Call execute_query_stateless (writes result to queryState)
  * 3. Commit changes back to L1
  */
-export async function executeQueryInTee<T>(
+export async function executeQueryInTee<T extends Idl>(
   l1Connection: Connection,
   l1Program: Program<T>,
   teeConnection: Connection,
@@ -211,7 +211,7 @@ export async function waitForCommit(
 /**
  * Complete TEE execution flow
  */
-export async function executePrivateQuery<T>(params: {
+export async function executePrivateQuery<T extends Idl>(params: {
   l1Connection: Connection;
   l1Program: Program<T>;
   wallet: Keypair;
@@ -318,7 +318,7 @@ export async function executePrivateQuery<T>(params: {
  * Alternative: Execute without creating QueryResult account
  * Uses stateless mode + event parsing
  */
-export async function executeQueryStatelessWithEvents<T>(params: {
+export async function executeQueryStatelessWithEvents<T extends Idl>(params: {
   teeConnection: Connection;
   teeProgram: Program<T>;
   wallet: Keypair;
@@ -387,7 +387,7 @@ function sleep(ms: number): Promise<void> {
 /**
  * Correct TEE execution test
  */
-export async function testCorrectTeeFlow<T>(
+export async function testCorrectTeeFlow<T extends Idl>(
   l1Connection: Connection,
   l1Program: Program<T>,
   wallet: Keypair

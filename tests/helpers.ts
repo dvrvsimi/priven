@@ -154,11 +154,11 @@ export async function executeQueryNative(
   const queryState = await l1Program.account.queryState.fetch(queryStatePda);
   console.log("  [Native] Fetched query state");
 
-  // 2. Decrypt predicate using ORIGINAL encrypted data (stored in global for this test)
-  const originalCt = (global as any).originalCiphertext;
-  const originalPub = (global as any).originalPubkey;
+  // 2. Decrypt predicate using ON-CHAIN data (proper E2E flow)
+  const encryptedPredicate = new Uint8Array(queryState.encryptedPredicate);
+  const userPubkey = new Uint8Array(queryState.userPubkey);
 
-  const predicate = await decryptPredicateNative(originalCt, teePrivateKey, originalPub);
+  const predicate = await decryptPredicateNative(encryptedPredicate, teePrivateKey, userPubkey);
   console.log("  [Native] Decrypted predicate, version:", predicate.version, "filters:", predicate.filters.length);
 
   // 3. Evaluate pools NATIVELY

@@ -127,14 +127,15 @@ export class PrivenClient {
       console.log(`  Predicate V1: TVL range ${predicate.minTvl} - ${predicate.maxTvl}`);
     }
 
-    // Step 1: Fetch pools
-    console.log("\nStep 1/6: Fetching pools from QuickNode...");
-    const pools = await fetchRaydiumPoolsWithRetry(this.baseConnection, {
-      status: 1,
+    console.log("\nStep 1/6: Fetching pools from mainnet...");
+    const mainnetRpc = options?.mainnetRpc || process.env.QUICKNODE_MAINNET_RPC || "https://api.mainnet-beta.solana.com";
+    const mainnetConnection = new Connection(mainnetRpc, "confirmed");
+    const pools = await fetchRaydiumPoolsWithRetry(mainnetConnection, {
+      status: 6,
     });
 
     if (pools.length === 0) {
-      throw new Error("No Raydium pools found");
+      throw new Error("No Raydium pools found on mainnet");
     }
 
     const selectedPools = pools.slice(0, maxPools);
@@ -226,10 +227,13 @@ export class PrivenClient {
    * Delegate query to TEE
    */
   private async delegateQuery(queryId: BN): Promise<string> {
+    const [queryStatePda] = this.deriveQueryStatePda(queryId);
+
     const tx = await this.program.methods
-      .delegateQuery()
+      .delegateQuery(queryId)
       .accounts({
         user: this.wallet.publicKey,
+        queryState: queryStatePda,
       })
       .signers([this.wallet])
       .rpc();
@@ -269,11 +273,18 @@ export class PrivenClient {
       teeProvider
     );
 
+    const [queryStatePda] = this.deriveQueryStatePda(queryId);
+
     // Execute in TEE using stateless mode - result stored in QueryState
     const tx = await teeProgram.methods
-      .executeQueryStateless(Array.from(decryptionKey.slice(0, 32)) as number[])
+      .executeQueryStateless(
+        Array.from(decryptionKey.slice(0, 32)) as number[],
+        this.wallet.publicKey,
+        queryId
+      )
       .accounts({
         caller: this.wallet.publicKey,
+        queryState: queryStatePda,
       })
       .signers([this.wallet])
       .rpc();
@@ -285,7 +296,7 @@ export class PrivenClient {
    * Commit result back to L1 using Magic Actions
    * This schedules: commit QueryState + write_result_action (creates QueryResult on L1)
    */
-  private async commitResult(_queryId: BN): Promise<string> {
+  private async commitResult(queryId: BN): Promise<string> {
     if (!this.teeSession) {
       throw new Error("TEE session not initialized");
     }
@@ -306,11 +317,14 @@ export class PrivenClient {
       teeProvider
     );
 
+    const [queryStatePda] = this.deriveQueryStatePda(queryId);
+
     // Use Magic Actions: commit + write_result_action atomically
     const tx = await teeProgram.methods
       .commitAndWriteResult()
       .accounts({
         payer: this.wallet.publicKey,
+        queryState: queryStatePda,
       })
       .signers([this.wallet])
       .rpc();

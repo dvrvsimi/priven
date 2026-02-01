@@ -1,0 +1,8 @@
+{
+  "rpcUrl": "https://api.devnet.solana.com",
+  "network": "devnet",
+  "programId": "EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM",
+  "wallet": "~/.config/solana/id.json",
+  "defaultMaxPools": 5,
+  "teeRpc": "https://tee.magicblock.app"
+}

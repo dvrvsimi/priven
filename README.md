@@ -179,6 +179,6 @@ MIT
 
 ## Acknowledgements
 
-Built for the Solana Hackathon with:
+Built for the Solana Privacy wHackathon with:
 - [QuickNode](https://quicknode.com) - RPC and Streams
 - [MagicBlock](https://magicblock.gg) - Ephemeral Rollups + TEE

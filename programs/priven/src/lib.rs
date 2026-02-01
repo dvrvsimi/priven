@@ -2,7 +2,6 @@ use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::anchor::{action, commit, delegate, ephemeral};
 use ephemeral_rollups_sdk::ephem::commit_and_undelegate_accounts;
 
-// Crypto imports for AES-GCM
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -133,7 +132,6 @@ pub mod priven {
         query_state.submitted_at = Clock::get()?.unix_timestamp;
         query_state.bump = ctx.bumps.query_state;
 
-        // Copy pool data
         for (i, pool) in pools.iter().enumerate() {
             query_state.pools[i] = *pool;
         }
@@ -177,7 +175,6 @@ pub mod priven {
 
         query_state.status = QueryStatus::Executing;
 
-        // Execute private query inside TEE
         let (encrypted_result, encrypted_len, success) = execute_private_query(
             &query_state.encrypted_predicate,
             &decryption_key,
@@ -185,7 +182,6 @@ pub mod priven {
             &query_state.pools[..query_state.pool_count as usize],
         );
 
-        // Store result
         query_result.owner = query_state.owner;
         query_result.query_id = query_state.query_id;
         query_result.encrypted_result = encrypted_result;
@@ -236,7 +232,6 @@ pub mod priven {
 
         query_state.status = QueryStatus::Executing;
 
-        // Execute private query inside TEE
         let (encrypted_result, encrypted_len, success) = execute_private_query(
             &query_state.encrypted_predicate,
             &decryption_key,
@@ -255,7 +250,6 @@ pub mod priven {
             QueryStatus::Failed
         };
 
-        // Extract match count
         let match_count = if encrypted_len > 0 { encrypted_result[0] } else { 0 };
 
         // Emit result in event (for immediate client access)
@@ -299,7 +293,6 @@ pub mod priven {
             PrivenError::QueryMismatch
         );
 
-        // Emit completion event
         emit!(QueryCompleted {
             query_id: query_state.query_id,
             owner: query_state.owner,
@@ -445,7 +438,6 @@ pub mod priven {
             PrivenError::InvalidQueryStatus
         );
 
-        // Store the pre-computed encrypted result
         query_state.encrypted_result = encrypted_result;
         query_state.encrypted_len = encrypted_len;
         query_state.execution_success = success;
@@ -906,7 +898,6 @@ fn decrypt_predicate(
     ct_with_tag.extend_from_slice(ciphertext);
     ct_with_tag.extend_from_slice(tag);
 
-    // Decrypt
     let nonce = Nonce::from_slice(nonce_bytes);
     cipher.decrypt(nonce, ct_with_tag.as_ref()).ok()
 }
@@ -917,15 +908,12 @@ fn encrypt_result_data(
     user_public_key: &[u8; 32],
     tee_private_key: &[u8; 32],
 ) -> Option<Vec<u8>> {
-    // Derive shared secret
     let tee_secret = StaticSecret::from(*tee_private_key);
     let user_pubkey = X25519PublicKey::from(*user_public_key);
     let shared_secret = tee_secret.diffie_hellman(&user_pubkey);
 
-    // Derive AES key
     let aes_key = derive_aes_key(shared_secret.as_bytes());
 
-    // Initialize cipher
     let cipher = Aes256Gcm::new_from_slice(&aes_key).ok()?;
 
     // Generate deterministic nonce from hash of plaintext (for reproducibility)
@@ -1092,13 +1080,11 @@ fn execute_private_query(
 
     // Step 2: Parse predicate (detect version)
     let predicate = if !decrypted.is_empty() && decrypted[0] == 2 {
-        // V2 format
         match parse_predicate_v2(&decrypted) {
             Some(p) => p,
             None => return ([0u8; ENCRYPTED_RESULT_SIZE], 0, false),
         }
     } else {
-        // V1 legacy format
         match parse_predicate_v1(&decrypted) {
             Some(p) => p,
             None => return ([0u8; ENCRYPTED_RESULT_SIZE], 0, false),
@@ -1129,7 +1115,6 @@ fn execute_private_query(
         plaintext[offset..offset + 32].copy_from_slice(pubkey.as_ref());
     }
 
-    // Encrypt result back to user
     let encrypted_result_vec =
         match encrypt_result_data(&plaintext, user_pubkey, decryption_key) {
             Some(e) => e,
@@ -1142,7 +1127,6 @@ fn execute_private_query(
             }
         };
 
-    // Copy to fixed-size array
     let mut result = [0u8; ENCRYPTED_RESULT_SIZE];
     let copy_len = encrypted_result_vec.len().min(ENCRYPTED_RESULT_SIZE);
     result[..copy_len].copy_from_slice(&encrypted_result_vec[..copy_len]);
