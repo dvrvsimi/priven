@@ -1,261 +1,158 @@
 /**
- * SPL Token Account Fetching for Priven
+ * Token Discovery Module
  *
- * Fetches token accounts via QuickNode RPC for use in private queries.
- * Works on both devnet and mainnet (unlike Raydium V4 which is mainnet-only).
- *
- * Privacy angle: The predicate filters by balance threshold, which reveals
- * trading intent (e.g., "show me accounts with >10K tokens" = accumulation).
- * TEE execution hides this threshold from observers.
+ * Functions for discovering token holders and accounts.
+ * Used by TEE executor for TOKEN_BALANCE and TOKEN_OWNERSHIP queries.
  */
-import {
-  Connection,
-  PublicKey,
-  AccountInfo,
-  GetProgramAccountsFilter,
-  Commitment,
-} from "@solana/web3.js";
-import type { PoolData } from "./types";
+import { Connection, PublicKey } from "@solana/web3.js";
 
-/**
- * SPL Token Program ID
- */
-export const TOKEN_PROGRAM_ID = new PublicKey(
-  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-);
+/** SPL Token Program ID */
+export const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
-/**
- * SPL Token account size (165 bytes)
- */
-export const TOKEN_ACCOUNT_SIZE = 165;
+/** Token account data layout offsets */
+const TOKEN_ACCOUNT_SIZE = 165;
+const MINT_OFFSET = 0;
+const OWNER_OFFSET = 32;
+const AMOUNT_OFFSET = 64;
 
-/**
- * Token account layout offsets
- * Based on SPL Token standard layout
- */
-const TOKEN_ACCOUNT_OFFSETS = {
-  mint: 0, // Pubkey (32 bytes)
-  owner: 32, // Pubkey (32 bytes)
-  amount: 64, // u64 (8 bytes)
-  delegate: 72, // COption<Pubkey> (4 + 32 bytes)
-  state: 108, // AccountState (1 byte)
-  isNative: 109, // COption<u64> (4 + 8 bytes)
-  delegatedAmount: 121, // u64 (8 bytes)
-  closeAuthority: 129, // COption<Pubkey> (4 + 32 bytes)
-};
-
-/**
- * Filters for fetching token accounts
- */
-export interface TokenFilters {
-  /** Filter by token mint */
-  mint?: PublicKey;
-  /** Filter by owner wallet */
-  owner?: PublicKey;
-  /** Minimum balance to include (client-side filter) */
-  minBalance?: bigint;
-}
-
-/**
- * Token account data with balance
- */
-export interface TokenAccountData {
-  /** Token account address */
-  address: PublicKey;
-  /** Token mint */
-  mint: PublicKey;
-  /** Owner wallet */
+/** Token account info */
+export interface TokenAccountInfo {
   owner: PublicKey;
-  /** Token balance */
+  mint: PublicKey;
   balance: bigint;
+  address: PublicKey;
+}
+
+/** Options for token discovery */
+export interface TokenDiscoveryOptions {
+  minBalance?: bigint;
+  maxBalance?: bigint;
+  limit?: number;
 }
 
 /**
- * Fetch SPL Token accounts from QuickNode RPC
- *
- * Maps token accounts to PoolData format for compatibility with Priven:
- * - address = token account pubkey
- * - tokenAReserve = token balance
- * - tokenBReserve = 0 (unused)
- *
- * @param connection - Solana connection (QuickNode endpoint)
- * @param filters - Optional filters
- * @param commitment - Confirmation level
- * @returns Array of token accounts as PoolData
+ * Discover token accounts for a specific mint
+ * Returns all token accounts holding the specified token
  */
-export async function fetchTokenAccounts(
+export async function discoverTokenAccounts(
   connection: Connection,
-  filters?: TokenFilters,
-  commitment: Commitment = "confirmed"
-): Promise<PoolData[]> {
-  console.log("Fetching SPL Token accounts...");
-
-  const programFilters: GetProgramAccountsFilter[] = [
-    { dataSize: TOKEN_ACCOUNT_SIZE },
-  ];
-
-  // Filter by mint (on-chain filter)
-  if (filters?.mint) {
-    programFilters.push({
-      memcmp: {
-        offset: TOKEN_ACCOUNT_OFFSETS.mint,
-        bytes: filters.mint.toBase58(),
-      },
-    });
-  }
-
-  // Filter by owner (on-chain filter)
-  if (filters?.owner) {
-    programFilters.push({
-      memcmp: {
-        offset: TOKEN_ACCOUNT_OFFSETS.owner,
-        bytes: filters.owner.toBase58(),
-      },
-    });
-  }
-
-  try {
-    const accounts = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
-      filters: programFilters,
-      commitment,
-    });
-
-    console.log(`Found ${accounts.length} token accounts`);
-
-    // Parse accounts
-    let parsed = accounts
-      .map((acc) => parseTokenAccountToPoolData(acc.pubkey, acc.account))
-      .filter((p): p is PoolData => p !== null);
-
-    // Apply balance filter client-side
-    if (filters?.minBalance !== undefined) {
-      parsed = parsed.filter((p) => p.tokenAReserve >= filters.minBalance!);
-      console.log(
-        `Filtered to ${parsed.length} accounts with balance >= ${filters.minBalance}`
-      );
-    }
-
-    return parsed;
-  } catch (error) {
-    console.error("Error fetching token accounts:", error);
-    throw new Error(`Failed to fetch token accounts: ${error}`);
-  }
-}
-
-/**
- * Fetch token accounts by owner using getTokenAccountsByOwner
- *
- * Faster than getProgramAccounts when filtering by owner.
- *
- * @param connection - Solana connection
- * @param owner - Owner wallet public key
- * @param mint - Optional: filter by specific mint
- * @param commitment - Confirmation level
- * @returns Array of token accounts
- */
-export async function fetchTokenAccountsByOwner(
-  connection: Connection,
-  owner: PublicKey,
-  mint?: PublicKey,
-  commitment: Commitment = "confirmed"
-): Promise<TokenAccountData[]> {
-  console.log(`Fetching token accounts for owner: ${owner.toBase58()}`);
-
-  const filter = mint
-    ? { mint }
-    : { programId: TOKEN_PROGRAM_ID };
-
-  const accounts = await connection.getTokenAccountsByOwner(owner, filter, {
-    commitment,
+  tokenMint: PublicKey,
+  options?: TokenDiscoveryOptions
+): Promise<TokenAccountInfo[]> {
+  const accounts = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
+    filters: [
+      { dataSize: TOKEN_ACCOUNT_SIZE },
+      { memcmp: { offset: MINT_OFFSET, bytes: tokenMint.toBase58() } },
+    ],
   });
 
-  console.log(`Found ${accounts.value.length} token accounts`);
+  const results: TokenAccountInfo[] = [];
 
-  return accounts.value.map((acc) => {
-    const data = acc.account.data;
-    return {
-      address: acc.pubkey,
-      mint: new PublicKey(data.subarray(0, 32)),
-      owner: new PublicKey(data.subarray(32, 64)),
-      balance: data.readBigUInt64LE(TOKEN_ACCOUNT_OFFSETS.amount),
-    };
-  });
-}
+  for (const { pubkey, account } of accounts) {
+    const data = account.data;
+    const balance = data.readBigUInt64LE(AMOUNT_OFFSET);
 
-/**
- * Convert TokenAccountData to PoolData format
- */
-export function toPoolData(account: TokenAccountData): PoolData {
-  return {
-    address: account.address,
-    tokenAReserve: account.balance,
-    tokenBReserve: 0n,
-  };
-}
-
-/**
- * Parse a token account into PoolData format
- */
-function parseTokenAccountToPoolData(
-  pubkey: PublicKey,
-  accountInfo: AccountInfo<Buffer>
-): PoolData | null {
-  try {
-    const data = accountInfo.data;
-
-    if (data.length !== TOKEN_ACCOUNT_SIZE) {
-      return null;
+    // Apply balance filters
+    if (options?.minBalance !== undefined && balance < options.minBalance) {
+      continue;
+    }
+    if (options?.maxBalance !== undefined && balance > options.maxBalance) {
+      continue;
     }
 
-    // Read balance at offset 64
-    const balance = data.readBigUInt64LE(TOKEN_ACCOUNT_OFFSETS.amount);
-
-    return {
+    results.push({
+      owner: new PublicKey(data.slice(OWNER_OFFSET, OWNER_OFFSET + 32)),
+      mint: tokenMint,
+      balance,
       address: pubkey,
-      tokenAReserve: balance,
-      tokenBReserve: 0n,
-    };
-  } catch {
-    return null;
-  }
-}
+    });
 
-/**
- * Fetch token accounts with retry logic
- */
-export async function fetchTokenAccountsWithRetry(
-  connection: Connection,
-  filters?: TokenFilters,
-  maxRetries: number = 3
-): Promise<PoolData[]> {
-  let lastError: Error | null = null;
-
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      if (attempt > 0) {
-        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
-        console.log(`Retry attempt ${attempt + 1} after ${delay}ms...`);
-        await new Promise((r) => setTimeout(r, delay));
-      }
-
-      return await fetchTokenAccounts(connection, filters);
-    } catch (error) {
-      lastError = error as Error;
-      console.warn(`Attempt ${attempt + 1} failed:`, error);
+    // Apply limit
+    if (options?.limit !== undefined && results.length >= options.limit) {
+      break;
     }
   }
 
-  throw lastError || new Error("Failed to fetch token accounts after retries");
+  return results;
 }
 
 /**
- * Well-known token mints for testing
+ * Discover unique token holders for a specific mint
+ * Returns list of wallet addresses holding the token
  */
-export const KNOWN_MINTS = {
-  /** Wrapped SOL (exists on all networks) */
-  WSOL: new PublicKey("So11111111111111111111111111111111111111112"),
-  /** USDC on mainnet */
-  USDC_MAINNET: new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
-  /** USDC-Dev on devnet */
-  USDC_DEVNET: new PublicKey("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"),
-};
+export async function discoverTokenHolders(
+  connection: Connection,
+  tokenMint: PublicKey,
+  options?: TokenDiscoveryOptions
+): Promise<PublicKey[]> {
+  const accounts = await discoverTokenAccounts(connection, tokenMint, options);
+
+  // Deduplicate owners (a wallet may have multiple token accounts)
+  const owners = new Set<string>();
+  const result: PublicKey[] = [];
+
+  for (const account of accounts) {
+    const ownerStr = account.owner.toBase58();
+    if (!owners.has(ownerStr)) {
+      owners.add(ownerStr);
+      result.push(account.owner);
+
+      if (options?.limit !== undefined && result.length >= options.limit) {
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Get token balance for a specific wallet and mint
+ */
+export async function getTokenBalance(
+  connection: Connection,
+  wallet: PublicKey,
+  tokenMint: PublicKey
+): Promise<bigint> {
+  const accounts = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
+    filters: [
+      { dataSize: TOKEN_ACCOUNT_SIZE },
+      { memcmp: { offset: MINT_OFFSET, bytes: tokenMint.toBase58() } },
+      { memcmp: { offset: OWNER_OFFSET, bytes: wallet.toBase58() } },
+    ],
+  });
+
+  let totalBalance = 0n;
+  for (const { account } of accounts) {
+    totalBalance += account.data.readBigUInt64LE(AMOUNT_OFFSET);
+  }
+
+  return totalBalance;
+}
+
+/**
+ * Check if wallet holds a specific token
+ */
+export async function hasTokenBalance(
+  connection: Connection,
+  wallet: PublicKey,
+  tokenMint: PublicKey,
+  minBalance?: bigint
+): Promise<boolean> {
+  const balance = await getTokenBalance(connection, wallet, tokenMint);
+  return balance >= (minBalance ?? 1n);
+}
+
+/**
+ * Get holder count for a specific token mint
+ */
+export async function getHolderCount(
+  connection: Connection,
+  tokenMint: PublicKey,
+  minBalance?: bigint
+): Promise<number> {
+  const holders = await discoverTokenHolders(connection, tokenMint, {
+    minBalance: minBalance ?? 1n,
+  });
+  return holders.length;
+}

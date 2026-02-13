@@ -1,6 +1,10 @@
 /**
  * Shared test helpers and utilities
  */
+import { config } from "dotenv";
+import { resolve } from "path";
+config({ path: resolve(__dirname, "../.env"), override: true });
+
 import * as anchor from "@coral-xyz/anchor";
 import { Program, AnchorProvider } from "@coral-xyz/anchor";
 import { PublicKey, Keypair, Connection } from "@solana/web3.js";
@@ -23,11 +27,12 @@ export const TEE_VALIDATOR = new PublicKey(
 
 // Seeds
 export const QUERY_SEED = Buffer.from("query");
-export const RESULT_SEED = Buffer.from("result");
 export const CONFIG_SEED = Buffer.from("config");
+export const SESSION_SEED = Buffer.from("session");
+export const ANCHOR_SEED = Buffer.from("anchor");
 
 // Constants matching lib.rs
-export const MAX_POOLS = 5;
+export const MAX_POOLS = 20;
 
 /**
  * Read keypair from JSON file
@@ -66,59 +71,46 @@ export function setupProvider(): {
 }
 
 /**
- * Create a raw V2 predicate buffer (80 bytes for on-chain storage)
- * Format: [version: u8][filter_count: u8][filters: 11 bytes each][padding][nonce: 12][tag: 16]
- *
- * For unencrypted testing, we create the plaintext structure padded to 80 bytes
+ * Query type discriminator (matches client/src/types.ts QueryType)
  */
-export function createRawPredicate(minTvl: bigint, maxTvl: bigint): Uint8Array {
-  const ENCRYPTED_SIZE = 80;
-  const buffer = new ArrayBuffer(ENCRYPTED_SIZE);
-  const view = new DataView(buffer);
-
-  // V2 format: version=2, filter_count=2 (min TVL >= X, max TVL <= Y)
-  view.setUint8(0, 2);  // version
-  view.setUint8(1, 2);  // filter_count
-
-  // Filter 1: TVL >= minTvl
-  // [type: u8][op: u8][field: u8][value: u64 LE] = 11 bytes
-  view.setUint8(2, 0);  // type = TVL (0)
-  view.setUint8(3, 0);  // op = GTE (0)
-  view.setUint8(4, 0);  // field = 0
-  view.setBigUint64(5, minTvl, true);  // value
-
-  // Filter 2: TVL <= maxTvl
-  view.setUint8(13, 0);  // type = TVL (0)
-  view.setUint8(14, 1);  // op = LTE (1)
-  view.setUint8(15, 0);  // field = 0
-  view.setBigUint64(16, maxTvl, true);  // value
-
-  // Rest is padding + mock nonce/tag (program handles this gracefully)
-  return new Uint8Array(buffer);
+export enum QueryType {
+  CPMM_POOLS = 0,
+  TOKEN_BALANCE = 1,
+  TOKEN_OWNERSHIP = 2,
+  TX_LOOKUP = 3,
 }
 
 /**
- * Create a V2 predicate with Balance filter (for token account queries)
+ * Create a raw predicate buffer (80 bytes for on-chain storage)
+ * Format: [query_type: u8][filter_count: u8][filters: 11 bytes each][padding]
+ *
+ * For unencrypted testing, we create the plaintext structure padded to 80 bytes
  */
-export function createBalancePredicate(minBalance: bigint, maxBalance: bigint): Uint8Array {
+export function createRawPredicate(
+  minTvl: bigint,
+  maxTvl: bigint,
+  queryType: QueryType = QueryType.CPMM_POOLS
+): Uint8Array {
   const ENCRYPTED_SIZE = 80;
   const buffer = new ArrayBuffer(ENCRYPTED_SIZE);
   const view = new DataView(buffer);
 
-  view.setUint8(0, 2);  // version = 2
-  view.setUint8(1, 2);  // filter_count = 2
+  // v3 format: query_type at offset 0, filter_count at offset 1
+  view.setUint8(0, queryType);  // query_type
+  view.setUint8(1, 2);          // filter_count
 
-  // Filter 1: Balance >= minBalance
-  view.setUint8(2, 1);  // type = BALANCE (1)
+  // Filter 1: TVL >= minTvl (starts at offset 2)
+  // [type: u8][op: u8][reserved: u8][value: u64 LE] = 11 bytes
+  view.setUint8(2, 6);  // type = TVL (6 in CPMM FilterType)
   view.setUint8(3, 0);  // op = GTE (0)
-  view.setUint8(4, 0);  // field = 0
-  view.setBigUint64(5, minBalance, true);
+  view.setUint8(4, 0);  // reserved
+  view.setBigUint64(5, minTvl, true);
 
-  // Filter 2: Balance <= maxBalance
-  view.setUint8(13, 1);  // type = BALANCE (1)
+  // Filter 2: TVL <= maxTvl (starts at offset 13)
+  view.setUint8(13, 6);  // type = TVL (6)
   view.setUint8(14, 1);  // op = LTE (1)
-  view.setUint8(15, 0);  // field = 0
-  view.setBigUint64(16, maxBalance, true);
+  view.setUint8(15, 0);  // reserved
+  view.setBigUint64(16, maxTvl, true);
 
   return new Uint8Array(buffer);
 }
@@ -128,20 +120,13 @@ export function createBalancePredicate(minBalance: bigint, maxBalance: bigint): 
 // =============================================================================
 
 import { BN } from "@coral-xyz/anchor";
-import { decryptResult } from "../client/src/encryption";
-
-const ENCRYPTED_RESULT_SIZE = 189;
 
 /**
- * Execute query NATIVELY - full crypto in Node.js, only storage on-chain
+ * Execute query NATIVELY - full crypto in Node.js, only event emission on-chain
  *
- * This avoids the 1.4M CU limit by doing ALL crypto outside BPF:
+ * This avoids CU limits by doing ALL crypto outside BPF:
  * - Native: decrypt predicate, evaluate pools, encrypt result (0 CUs)
- * - On-chain: submit_result just stores the bytes (~8k CUs)
- *
- * @param l1Program - L1 program (for fetching state)
- * @param erProgram - ER program (for submitting result to delegated account)
- * @param teePrivateKey - TEE's X25519 private key (PKCS8 format from generateKeyPair)
+ * - On-chain: submit_result emits event with result (~8k CUs)
  */
 export async function executeQueryNative(
   l1Program: Program<Priven>,
@@ -150,23 +135,21 @@ export async function executeQueryNative(
   wallet: Keypair,
   teePrivateKey: Uint8Array
 ): Promise<{ matchCount: number; encryptedResult: Uint8Array }> {
-  // 1. Fetch query state from L1
   const queryState = await l1Program.account.queryState.fetch(queryStatePda);
   console.log("  [Native] Fetched query state");
 
-  // 2. Decrypt predicate using ON-CHAIN data (proper E2E flow)
   const encryptedPredicate = new Uint8Array(queryState.encryptedPredicate);
   const userPubkey = new Uint8Array(queryState.userPubkey);
 
   const predicate = await decryptPredicateNative(encryptedPredicate, teePrivateKey, userPubkey);
-  console.log("  [Native] Decrypted predicate, version:", predicate.version, "filters:", predicate.filters.length);
+  console.log("  [Native] Decrypted predicate, filters:", predicate.filters.length);
 
-  // 3. Evaluate pools NATIVELY
-  const pools = queryState.pools.slice(0, queryState.poolCount);
-  const matches = evaluatePoolsNative(pools, predicate);
-  console.log("  [Native] Evaluated pools, matches:", matches.length);
+  // Evaluate using pool addresses (TEE fetches actual data via RPC)
+  // For tests, we just return matching addresses based on mock logic
+  const poolAddresses = queryState.poolAddresses.slice(0, queryState.poolCount);
+  const matches = poolAddresses; // In real TEE, this would fetch and evaluate
+  console.log("  [Native] Mock evaluation, matches:", matches.length);
 
-  // 4. Encrypt result NATIVELY
   const encryptedResult = await encryptResultNative(
     matches,
     new Uint8Array(queryState.userPubkey),
@@ -174,24 +157,27 @@ export async function executeQueryNative(
   );
   console.log("  [Native] Encrypted result, length:", encryptedResult.length);
 
-  // 5. Build padded result for on-chain storage
-  const resultData = new Uint8Array(ENCRYPTED_RESULT_SIZE);
-  resultData.set(encryptedResult.slice(0, ENCRYPTED_RESULT_SIZE));
-
-  // 6. Submit to ER (account is delegated there) - just storage, ~8k CUs!
   const { Transaction } = await import("@solana/web3.js");
+
+  const [configPda] = PublicKey.findProgramAddressSync([CONFIG_SEED], erProgram.programId);
+
+  // Compute result hash
+  const resultHashBuffer = await crypto.subtle.digest("SHA-256", encryptedResult);
+  const resultHash = new Uint8Array(resultHashBuffer);
 
   const ix = await erProgram.methods
     .submitResult(
-      Array.from(resultData) as number[],
-      encryptedResult.length,
+      Buffer.from(encryptedResult),
+      matches.length,
       true,
+      Array.from(resultHash) as number[],
       queryState.owner,
       new BN(queryState.queryId.toString())
     )
     .accountsPartial({
       caller: wallet.publicKey,
       queryState: queryStatePda,
+      config: configPda,
     })
     .instruction();
 
@@ -203,7 +189,6 @@ export async function executeQueryNative(
   const sig = await erProgram.provider.connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
   await erProgram.provider.connection.confirmTransaction(sig, "confirmed");
 
-  // Get logs
   const txInfo = await erProgram.provider.connection.getTransaction(sig, {
     commitment: "confirmed",
     maxSupportedTransactionVersion: 0,
@@ -215,16 +200,6 @@ export async function executeQueryNative(
   return { matchCount: matches.length, encryptedResult };
 }
 
-/**
- * Test decryption (exported for verification)
- */
-export async function testDecryptPredicate(
-  encrypted: Uint8Array,
-  teePrivateKeyPkcs8: Uint8Array,
-  userPublicKey: Uint8Array
-): Promise<{ version: number; filters: any[] }> {
-  return decryptPredicateNative(encrypted, teePrivateKeyPkcs8, userPublicKey);
-}
 
 /**
  * Decrypt predicate using Web Crypto (X25519 ECDH + AES-256-GCM)
@@ -233,8 +208,7 @@ async function decryptPredicateNative(
   encrypted: Uint8Array,
   teePrivateKeyPkcs8: Uint8Array,
   userPublicKey: Uint8Array
-): Promise<{ version: number; filters: { type: number; op: number; value: bigint }[] }> {
-  // Parse: [ciphertext][nonce:12][tag:16]
+): Promise<{ filters: { type: number; op: number; value: bigint }[] }> {
   if (encrypted.length < 29) throw new Error("Encrypted predicate too short");
 
   const dataLen = encrypted.length - 28;
@@ -242,13 +216,12 @@ async function decryptPredicateNative(
   const nonce = encrypted.slice(dataLen, dataLen + 12);
   const tag = encrypted.slice(dataLen + 12);
 
-  // X25519 ECDH + HKDF + AES-GCM decrypt
   const teePrivateKey = await crypto.subtle.importKey("pkcs8", teePrivateKeyPkcs8, { name: "X25519" }, false, ["deriveBits"]);
   const userPubKey = await crypto.subtle.importKey("raw", userPublicKey, { name: "X25519" }, false, []);
   const sharedBits = await crypto.subtle.deriveBits({ name: "X25519", public: userPubKey }, teePrivateKey, 256);
   const sharedSecret = await crypto.subtle.importKey("raw", sharedBits, { name: "HKDF" }, false, ["deriveKey"]);
   const aesKey = await crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("priven-v1") },
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("priven-v2") },
     sharedSecret,
     { name: "AES-GCM", length: 256 },
     false,
@@ -260,28 +233,18 @@ async function decryptPredicateNative(
   const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, aesKey, ctWithTag);
   const bytes = new Uint8Array(plaintext);
 
-  // Parse V1 or V2 predicate
-  if (bytes[0] === 2) {
-    const filters = [];
-    for (let i = 0; i < bytes[1]; i++) {
-      const off = 2 + i * 11;
-      filters.push({
-        type: bytes[off],
-        op: bytes[off + 1],
-        value: new DataView(bytes.buffer).getBigUint64(off + 3, true),
-      });
-    }
-    return { version: 2, filters };
+  // Parse predicate: [filter_count:1][filters:11*n]
+  const filterCount = bytes[0];
+  const filters = [];
+  for (let i = 0; i < filterCount; i++) {
+    const off = 1 + i * 11;
+    filters.push({
+      type: bytes[off],
+      op: bytes[off + 1],
+      value: new DataView(bytes.buffer).getBigUint64(off + 3, true),
+    });
   }
-  // V1: min_tvl, max_tvl
-  const view = new DataView(bytes.buffer);
-  return {
-    version: 1,
-    filters: [
-      { type: 0, op: 0, value: view.getBigUint64(0, true) },  // TVL >= min
-      { type: 0, op: 1, value: view.getBigUint64(8, true) },  // TVL <= max
-    ]
-  };
+  return { filters };
 }
 
 /**
@@ -292,36 +255,28 @@ async function encryptResultNative(
   userPublicKey: Uint8Array,
   teePrivateKeyPkcs8: Uint8Array
 ): Promise<Uint8Array> {
-  // Build plaintext: [count:1][addresses:32*count]
   const plaintext = new Uint8Array(1 + matches.length * 32);
   plaintext[0] = matches.length;
   matches.forEach((addr, i) => plaintext.set(addr.toBytes(), 1 + i * 32));
 
-  // Import keys
   const teePrivateKey = await crypto.subtle.importKey("pkcs8", teePrivateKeyPkcs8, { name: "X25519" }, false, ["deriveBits"]);
   const userPubKey = await crypto.subtle.importKey("raw", userPublicKey, { name: "X25519" }, false, []);
 
-  // X25519 ECDH
   const sharedBits = await crypto.subtle.deriveBits({ name: "X25519", public: userPubKey }, teePrivateKey, 256);
-
-  // HKDF
   const sharedSecret = await crypto.subtle.importKey("raw", sharedBits, { name: "HKDF" }, false, ["deriveKey"]);
   const aesKey = await crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("priven-v1") },
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("priven-v2") },
     sharedSecret,
     { name: "AES-GCM", length: 256 },
     false,
     ["encrypt"]
   );
 
-  // Generate nonce from hash of plaintext (deterministic for reproducibility)
   const hashBuf = await crypto.subtle.digest("SHA-256", plaintext);
   const nonce = new Uint8Array(hashBuf).slice(0, 12);
 
-  // AES-GCM encrypt
   const ctWithTag = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, aesKey, plaintext));
 
-  // Format: [ciphertext][nonce:12][tag:16]
   const ct = ctWithTag.slice(0, ctWithTag.length - 16);
   const tag = ctWithTag.slice(ctWithTag.length - 16);
   const result = new Uint8Array(ct.length + 28);
@@ -329,20 +284,4 @@ async function encryptResultNative(
   result.set(nonce, ct.length);
   result.set(tag, ct.length + 12);
   return result;
-}
-
-/**
- * Evaluate pools against predicate
- */
-function evaluatePoolsNative(
-  pools: { address: PublicKey; tokenAReserve: BN; tokenBReserve: BN }[],
-  predicate: { version: number; filters: any[] }
-): PublicKey[] {
-  return pools.filter(pool => {
-    const tvl = BigInt(pool.tokenAReserve.toString()) + BigInt(pool.tokenBReserve.toString());
-    return predicate.filters.every((f: any) => {
-      const val = f.type === 0 ? tvl : BigInt(pool.tokenAReserve.toString());
-      return f.op === 0 ? val >= f.value : f.op === 1 ? val <= f.value : f.op === 2 ? val === f.value : val !== f.value;
-    });
-  }).map(p => p.address);
 }

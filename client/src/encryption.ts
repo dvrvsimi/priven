@@ -3,60 +3,42 @@
  *
  * Provides encryption/decryption for MagicBlock TEE-based queries.
  * Uses Web Crypto API for AES-256-GCM + X25519 key exchange.
- *
- * Supports both V1 (legacy min/max TVL) and V2 (flexible filters) predicates.
  */
 import { PublicKey } from "@solana/web3.js";
 import type {
   Predicate,
-  PredicateV1,
-  PredicateV2,
   Filter,
   EncryptedPredicate,
   QueryResult,
 } from "./types";
 import {
+  QueryType,
   FilterType,
   FilterOp,
-  isPredicateV1,
-  isPredicateV2,
   ENCRYPTED_PREDICATE_SIZE,
-  ENCRYPTED_PREDICATE_SIZE_V1,
   MAX_FILTERS,
-  FILTER_SIZE,
 } from "./types";
 
-// AES-GCM constants
-const AES_KEY_SIZE = 32; // 256 bits
-const AES_NONCE_SIZE = 12; // 96 bits (standard for GCM)
-const AES_TAG_SIZE = 16; // 128 bits
+const AES_NONCE_SIZE = 12;
+const AES_TAG_SIZE = 16;
+const FILTER_SIZE = 11;
 
 /**
  * Encrypt a predicate for TEE evaluation using AES-256-GCM
- *
- * Uses X25519 ECDH for key exchange, derives AES key via HKDF
- *
- * @param predicate - User's search criteria (min_tvl, max_tvl)
- * @param teePublicKey - TEE's X25519 public key (32 bytes)
- * @returns Encrypted predicate with ephemeral public key and nonce
  */
 export async function encryptPredicate(
   predicate: Predicate,
   teePublicKey: Uint8Array
 ): Promise<EncryptedPredicate> {
-  // Generate ephemeral X25519 keypair
-  // Note: TypeScript doesn't know X25519 returns CryptoKeyPair, so cast to any
   const keyPair: any = await crypto.subtle.generateKey(
     { name: "X25519" },
     true,
     ["deriveBits"]
   );
 
-  // Export public key
   const publicKeyRaw = await crypto.subtle.exportKey("raw", keyPair.publicKey);
   const publicKey = new Uint8Array(publicKeyRaw);
 
-  // Import TEE's public key
   const teeKey = await crypto.subtle.importKey(
     "raw",
     teePublicKey,
@@ -65,130 +47,12 @@ export async function encryptPredicate(
     []
   );
 
-  // Derive shared secret via ECDH
   const sharedBits = await crypto.subtle.deriveBits(
     { name: "X25519", public: teeKey },
     keyPair.privateKey,
     256
   );
 
-  // Derive AES key from shared secret using HKDF
-  const sharedSecret = await crypto.subtle.importKey(
-    "raw",
-    sharedBits,
-    { name: "HKDF" },
-    false,
-    ["deriveKey"]
-  );
-
-  const aesKey = await crypto.subtle.deriveKey(
-    {
-      name: "HKDF",
-      hash: "SHA-256",
-      salt: new Uint8Array(32), // Zero salt for simplicity
-      info: new TextEncoder().encode("priven-v1"),
-    },
-    sharedSecret,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt"]
-  );
-
-  // Generate random nonce
-  const nonce = crypto.getRandomValues(new Uint8Array(AES_NONCE_SIZE));
-
-  // Serialize predicate based on version
-  const plaintext = serializePredicate(predicate);
-  const isV2 = isPredicateV2(predicate);
-
-  // Encrypt with AES-256-GCM
-  const ciphertextWithTag = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: nonce, tagLength: 128 },
-    aesKey,
-    plaintext
-  );
-
-  // V1 format: [ciphertext: 16 bytes] [nonce: 12 bytes] [tag: 16 bytes] = 44 bytes
-  // V2 format: [ciphertext: 52 bytes padded] [nonce: 12 bytes] [tag: 16 bytes] = 80 bytes
-  const encrypted = new Uint8Array(ciphertextWithTag);
-  const ctLen = encrypted.length - AES_TAG_SIZE; // Subtract tag
-
-  // Calculate output size
-  const outputSize = isV2 ? ENCRYPTED_PREDICATE_SIZE : ENCRYPTED_PREDICATE_SIZE_V1;
-  const ciphertext = new Uint8Array(outputSize);
-
-  // Split ciphertext and tag (WebCrypto appends tag to ciphertext)
-  ciphertext.set(encrypted.slice(0, ctLen), 0); // ciphertext
-  ciphertext.set(nonce, ctLen); // nonce
-  ciphertext.set(encrypted.slice(ctLen), ctLen + AES_NONCE_SIZE); // tag
-
-  const privateKey = new Uint8Array(
-    await crypto.subtle.exportKey("pkcs8", keyPair.privateKey)
-  );
-
-  return {
-    ciphertext,
-    publicKey,
-    privateKey,
-  };
-}
-
-/**
- * Decrypt query results from TEE using AES-256-GCM
- *
- * @param encryptedResult - Raw encrypted result from QueryResult account
- * @param privateKey - User's ephemeral X25519 private key (PKCS8 format)
- * @param teePublicKey - TEE's X25519 public key used for encryption
- * @returns Decrypted query results with matching pool addresses
- */
-export async function decryptResult(
-  encryptedResult: Uint8Array,
-  privateKey: Uint8Array,
-  teePublicKey: Uint8Array
-): Promise<QueryResult> {
-  // Parse encrypted result structure:
-  // [match_count: 1] [addresses: 32*5] [nonce: 12] [tag: 16]
-  // Total: 189 bytes max
-
-  if (encryptedResult.length < 29) {
-    // Minimum: 1 + 0 + 12 + 16
-    throw new Error(
-      `Invalid encrypted result: too short (${encryptedResult.length} bytes)`
-    );
-  }
-
-  // Find where nonce starts (end - 28: 12 nonce + 16 tag)
-  const dataLen = encryptedResult.length - 28;
-  const ciphertextData = encryptedResult.slice(0, dataLen);
-  const nonce = encryptedResult.slice(dataLen, dataLen + 12);
-  const tag = encryptedResult.slice(dataLen + 12);
-
-  // Import private key
-  const userPrivateKey = await crypto.subtle.importKey(
-    "pkcs8",
-    privateKey,
-    { name: "X25519" },
-    false,
-    ["deriveBits"]
-  );
-
-  // Import TEE public key
-  const teeKey = await crypto.subtle.importKey(
-    "raw",
-    teePublicKey,
-    { name: "X25519" },
-    false,
-    []
-  );
-
-  // Derive shared secret
-  const sharedBits = await crypto.subtle.deriveBits(
-    { name: "X25519", public: teeKey },
-    userPrivateKey,
-    256
-  );
-
-  // Derive AES key
   const sharedSecret = await crypto.subtle.importKey(
     "raw",
     sharedBits,
@@ -202,7 +66,91 @@ export async function decryptResult(
       name: "HKDF",
       hash: "SHA-256",
       salt: new Uint8Array(32),
-      info: new TextEncoder().encode("priven-v1"),
+      info: new TextEncoder().encode("priven-v2"),
+    },
+    sharedSecret,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt"]
+  );
+
+  const nonce = crypto.getRandomValues(new Uint8Array(AES_NONCE_SIZE));
+  const plaintext = serializePredicate(predicate);
+
+  const ciphertextWithTag = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: nonce, tagLength: 128 },
+    aesKey,
+    plaintext
+  );
+
+  const encrypted = new Uint8Array(ciphertextWithTag);
+  const ctLen = encrypted.length - AES_TAG_SIZE;
+
+  const ciphertext = new Uint8Array(ENCRYPTED_PREDICATE_SIZE);
+  ciphertext.set(encrypted.slice(0, ctLen), 0);
+  ciphertext.set(nonce, ctLen);
+  ciphertext.set(encrypted.slice(ctLen), ctLen + AES_NONCE_SIZE);
+
+  const privateKey = new Uint8Array(
+    await crypto.subtle.exportKey("pkcs8", keyPair.privateKey)
+  );
+
+  return { ciphertext, publicKey, privateKey };
+}
+
+/**
+ * Decrypt query results from TEE
+ */
+export async function decryptResult(
+  encryptedResult: Uint8Array,
+  privateKey: Uint8Array,
+  teePublicKey: Uint8Array
+): Promise<QueryResult> {
+  if (encryptedResult.length < 29) {
+    throw new Error(`Invalid encrypted result: too short`);
+  }
+
+  const dataLen = encryptedResult.length - 28;
+  const ciphertextData = encryptedResult.slice(0, dataLen);
+  const nonce = encryptedResult.slice(dataLen, dataLen + 12);
+  const tag = encryptedResult.slice(dataLen + 12);
+
+  const userPrivateKey = await crypto.subtle.importKey(
+    "pkcs8",
+    privateKey,
+    { name: "X25519" },
+    false,
+    ["deriveBits"]
+  );
+
+  const teeKey = await crypto.subtle.importKey(
+    "raw",
+    teePublicKey,
+    { name: "X25519" },
+    false,
+    []
+  );
+
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: "X25519", public: teeKey },
+    userPrivateKey,
+    256
+  );
+
+  const sharedSecret = await crypto.subtle.importKey(
+    "raw",
+    sharedBits,
+    { name: "HKDF" },
+    false,
+    ["deriveKey"]
+  );
+
+  const aesKey = await crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: new Uint8Array(32),
+      info: new TextEncoder().encode("priven-v2"),
     },
     sharedSecret,
     { name: "AES-GCM", length: 256 },
@@ -210,12 +158,10 @@ export async function decryptResult(
     ["decrypt"]
   );
 
-  // Reconstruct ciphertext+tag for WebCrypto (it expects them concatenated)
   const ciphertextWithTag = new Uint8Array(ciphertextData.length + 16);
   ciphertextWithTag.set(ciphertextData, 0);
   ciphertextWithTag.set(tag, ciphertextData.length);
 
-  // Decrypt
   const plaintext = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: nonce, tagLength: 128 },
     aesKey,
@@ -226,73 +172,39 @@ export async function decryptResult(
 }
 
 /**
- * Serialize predicate to bytes for AES encryption
- * Detects V1 vs V2 and calls appropriate serializer
+ * Serialize predicate to bytes
+ * Format: [query_type: u8][filter_count: u8][filters: Filter[]]
+ * Each filter: [type: u8][op: u8][reserved: u8][value: u64 LE] = 11 bytes
+ * Total: 1 + 1 + (4 * 11) = 46 bytes, padded to 52 bytes
  */
 function serializePredicate(predicate: Predicate): Uint8Array {
-  if (isPredicateV2(predicate)) {
-    return serializePredicateV2(predicate);
-  }
-  return serializePredicateV1(predicate as PredicateV1);
-}
-
-/**
- * Serialize V1 predicate to bytes
- * Format: [min_tvl: u64 LE] [max_tvl: u64 LE] = 16 bytes
- */
-function serializePredicateV1(predicate: PredicateV1): Uint8Array {
-  const buffer = new ArrayBuffer(16);
-  const view = new DataView(buffer);
-
-  // Write as little-endian u64
-  view.setBigUint64(0, predicate.minTvl, true);
-  view.setBigUint64(8, predicate.maxTvl, true);
-
-  return new Uint8Array(buffer);
-}
-
-/**
- * Serialize V2 predicate to bytes
- * Format: [version: u8][filter_count: u8][filters: Filter[]]
- * Each filter: [type: u8][op: u8][field: u8][value: u64 LE] = 11 bytes
- * Total: 2 + (11 * 4) = 46 bytes (padded to 52 bytes for alignment)
- */
-function serializePredicateV2(predicate: PredicateV2): Uint8Array {
   if (predicate.filters.length > MAX_FILTERS) {
     throw new Error(`Too many filters: ${predicate.filters.length} (max ${MAX_FILTERS})`);
   }
 
-  // V2 plaintext: version(1) + count(1) + filters(11*4) = 46 bytes
-  // Pad to 52 bytes so encrypted output fits nicely in 80 bytes
   const PLAINTEXT_SIZE = 52;
   const buffer = new ArrayBuffer(PLAINTEXT_SIZE);
   const view = new DataView(buffer);
 
-  // Version byte
-  view.setUint8(0, 2);
-
-  // Filter count
+  // Byte 0: query type (default to CPMM_POOLS for backward compatibility)
+  view.setUint8(0, predicate.queryType ?? QueryType.CPMM_POOLS);
+  // Byte 1: filter count
   view.setUint8(1, predicate.filters.length);
 
-  // Serialize each filter (11 bytes each)
+  // Filters start at offset 2
   for (let i = 0; i < predicate.filters.length; i++) {
     const filter = predicate.filters[i];
     const offset = 2 + i * FILTER_SIZE;
 
     view.setUint8(offset, filter.type);
     view.setUint8(offset + 1, filter.op);
-    view.setUint8(offset + 2, filter.field ?? 0);
-    view.setBigUint64(offset + 3, filter.value, true); // little-endian
+    view.setUint8(offset + 2, 0);
+    view.setBigUint64(offset + 3, filter.value, true);
   }
 
   return new Uint8Array(buffer);
 }
 
-/**
- * Parse decrypted QueryResult from bytes
- *
- * Format: [match_count: u8] [addresses: 32 * match_count]
- */
 function parseQueryResult(plaintext: Uint8Array): QueryResult {
   const matches: PublicKey[] = [];
 
@@ -301,36 +213,21 @@ function parseQueryResult(plaintext: Uint8Array): QueryResult {
   }
 
   const matchCount = plaintext[0];
-  const MAX_MATCHES = 5;
+  const MAX_MATCHES = 20;
 
   for (let i = 0; i < matchCount && i < MAX_MATCHES; i++) {
     const offset = 1 + i * 32;
     if (offset + 32 <= plaintext.length) {
       const addressBytes = plaintext.slice(offset, offset + 32);
-
-      // Skip zero addresses (padding)
-      if (!isZeroAddress(addressBytes)) {
+      if (!addressBytes.every((b) => b === 0)) {
         matches.push(new PublicKey(addressBytes));
       }
     }
   }
 
-  return {
-    matches,
-    matchCount,
-  };
+  return { matches, matchCount };
 }
 
-/**
- * Check if address is all zeros (padding)
- */
-function isZeroAddress(address: Uint8Array): boolean {
-  return address.every((byte) => byte === 0);
-}
-
-/**
- * Generate a random X25519 keypair for TEE communication
- */
 export async function generateKeyPair(): Promise<{
   publicKey: Uint8Array;
   privateKey: Uint8Array;
@@ -351,179 +248,211 @@ export async function generateKeyPair(): Promise<{
   return { publicKey, privateKey };
 }
 
-// ============================================================================
-// HELPER FUNCTIONS FOR CREATING PREDICATES
-// ============================================================================
-
-/**
- * Create a simple TVL range predicate (V1 style, but returns V2)
- *
- * @param minTvl - Minimum TVL in lamports
- * @param maxTvl - Maximum TVL in lamports
- * @returns V2 predicate with two TVL filters
- */
-export function createTvlPredicate(minTvl: bigint, maxTvl: bigint): PredicateV2 {
-  return {
-    version: 2,
-    filters: [
-      { type: FilterType.TVL, op: FilterOp.GTE, value: minTvl },
-      { type: FilterType.TVL, op: FilterOp.LTE, value: maxTvl },
-    ],
-  };
-}
-
-/**
- * Create a V2 predicate from an array of filters
- *
- * @param filters - Array of filters (max 4)
- * @returns V2 predicate
- */
-export function createPredicate(filters: Filter[]): PredicateV2 {
+export function createPredicate(filters: Filter[], queryType?: QueryType): Predicate {
   if (filters.length > MAX_FILTERS) {
     throw new Error(`Too many filters: ${filters.length} (max ${MAX_FILTERS})`);
   }
-  return {
-    version: 2,
-    filters,
-  };
+  return { queryType: queryType ?? QueryType.CPMM_POOLS, filters };
 }
 
-/**
- * Create a single filter
- *
- * @param type - Filter type (TVL, RESERVE_A, etc.)
- * @param op - Comparison operation (GTE, LTE, EQ, NEQ)
- * @param value - Value to compare against
- * @returns Filter object
- */
 export function createFilter(type: FilterType, op: FilterOp, value: bigint): Filter {
   return { type, op, value };
 }
 
-/**
- * Convert legacy V1 predicate to V2 format
- *
- * @param predicate - V1 predicate with minTvl/maxTvl
- * @returns Equivalent V2 predicate
- */
-export function convertV1ToV2(predicate: PredicateV1): PredicateV2 {
-  return createTvlPredicate(predicate.minTvl, predicate.maxTvl);
-}
-
-// Re-export types for convenience
-export { FilterType, FilterOp } from "./types";
-
-// ============================================================================
-// PREDICATE BUILDER (Fluent API)
-// ============================================================================
-
-/**
- * Fluent builder for creating V2 predicates
- *
- * @example
- * ```typescript
- * const predicate = new PredicateBuilder()
- *   .tvlBetween(1_000_000n, 10_000_000n)
- *   .minReserveRatio(40)
- *   .build();
- * ```
- */
 export class PredicateBuilder {
   private filters: Filter[] = [];
+  private queryType: QueryType = QueryType.CPMM_POOLS;
 
-  /**
-   * Add TVL range filter (min <= TVL <= max)
-   */
+  // ============================================================================
+  // CPMM Pool Methods
+  // ============================================================================
+
   tvlBetween(min: bigint, max: bigint): this {
+    this.queryType = QueryType.CPMM_POOLS;
     this.filters.push({ type: FilterType.TVL, op: FilterOp.GTE, value: min });
     this.filters.push({ type: FilterType.TVL, op: FilterOp.LTE, value: max });
     return this;
   }
 
-  /**
-   * Add minimum TVL filter (TVL >= min)
-   */
   minTvl(min: bigint): this {
+    this.queryType = QueryType.CPMM_POOLS;
     this.filters.push({ type: FilterType.TVL, op: FilterOp.GTE, value: min });
     return this;
   }
 
-  /**
-   * Add maximum TVL filter (TVL <= max)
-   */
   maxTvl(max: bigint): this {
+    this.queryType = QueryType.CPMM_POOLS;
     this.filters.push({ type: FilterType.TVL, op: FilterOp.LTE, value: max });
     return this;
   }
 
-  /**
-   * Add balance range filter (min <= balance <= max)
-   * For token account queries where balance is stored in tokenAReserve
-   */
-  balanceBetween(min: bigint, max: bigint): this {
-    this.filters.push({ type: FilterType.BALANCE, op: FilterOp.GTE, value: min });
-    this.filters.push({ type: FilterType.BALANCE, op: FilterOp.LTE, value: max });
+  minReserve0(min: bigint): this {
+    this.queryType = QueryType.CPMM_POOLS;
+    this.filters.push({ type: FilterType.RESERVE_0, op: FilterOp.GTE, value: min });
     return this;
   }
 
-  /**
-   * Add minimum balance filter
-   */
+  minReserve1(min: bigint): this {
+    this.queryType = QueryType.CPMM_POOLS;
+    this.filters.push({ type: FilterType.RESERVE_1, op: FilterOp.GTE, value: min });
+    return this;
+  }
+
+  // ============================================================================
+  // Token Balance Methods
+  // ============================================================================
+
+  tokenBalance(tokenMintValue: bigint): this {
+    this.queryType = QueryType.TOKEN_BALANCE;
+    this.filters.push({ type: FilterType.TOKEN_MINT, op: FilterOp.EQ, value: tokenMintValue });
+    return this;
+  }
+
   minBalance(min: bigint): this {
-    this.filters.push({ type: FilterType.BALANCE, op: FilterOp.GTE, value: min });
+    this.filters.push({ type: FilterType.MIN_BALANCE, op: FilterOp.GTE, value: min });
     return this;
   }
 
-  /**
-   * Add reserve ratio filter (ratio >= percent)
-   * Ratio is (reserveA / (reserveA + reserveB)) * 10000 in basis points
-   * @param percent - Minimum ratio percentage (0-100)
-   */
-  minReserveRatio(percent: number): this {
-    const bps = BigInt(Math.floor(percent * 100));
-    this.filters.push({ type: FilterType.RATIO, op: FilterOp.GTE, value: bps });
+  maxBalance(max: bigint): this {
+    this.filters.push({ type: FilterType.MAX_BALANCE, op: FilterOp.LTE, value: max });
     return this;
   }
 
-  /**
-   * Add reserve ratio filter (ratio <= percent)
-   * @param percent - Maximum ratio percentage (0-100)
-   */
-  maxReserveRatio(percent: number): this {
-    const bps = BigInt(Math.floor(percent * 100));
-    this.filters.push({ type: FilterType.RATIO, op: FilterOp.LTE, value: bps });
+  // ============================================================================
+  // Token Ownership Methods
+  // ============================================================================
+
+  tokenOwnership(tokenMintValue: bigint): this {
+    this.queryType = QueryType.TOKEN_OWNERSHIP;
+    this.filters.push({ type: FilterType.TOKEN_MINT, op: FilterOp.EQ, value: tokenMintValue });
     return this;
   }
 
-  /**
-   * Add reserve A filter
-   */
-  minReserveA(min: bigint): this {
-    this.filters.push({ type: FilterType.RESERVE_A, op: FilterOp.GTE, value: min });
+  // ============================================================================
+  // Transaction Lookup Methods
+  // ============================================================================
+
+  walletTransactions(walletValue: bigint): this {
+    this.queryType = QueryType.TX_LOOKUP;
+    this.filters.push({ type: FilterType.WALLET_ADDRESS, op: FilterOp.EQ, value: walletValue });
     return this;
   }
 
-  /**
-   * Add reserve B filter
-   */
-  minReserveB(min: bigint): this {
-    this.filters.push({ type: FilterType.RESERVE_B, op: FilterOp.GTE, value: min });
+  withProgram(programValue: bigint): this {
+    this.filters.push({ type: FilterType.PROGRAM_ID, op: FilterOp.EQ, value: programValue });
     return this;
   }
 
-  /**
-   * Add a custom filter
-   */
+  afterSlot(slot: bigint): this {
+    this.filters.push({ type: FilterType.AFTER_SLOT, op: FilterOp.GTE, value: slot });
+    return this;
+  }
+
+  beforeSlot(slot: bigint): this {
+    this.filters.push({ type: FilterType.BEFORE_SLOT, op: FilterOp.LTE, value: slot });
+    return this;
+  }
+
+  // ============================================================================
+  // Generic Methods
+  // ============================================================================
+
+  setQueryType(type: QueryType): this {
+    this.queryType = type;
+    return this;
+  }
+
   addFilter(type: FilterType, op: FilterOp, value: bigint): this {
     this.filters.push({ type, op, value });
     return this;
   }
 
-  /**
-   * Build the V2 predicate
-   * @throws Error if more than 4 filters
-   */
-  build(): PredicateV2 {
-    return createPredicate(this.filters);
+  build(): Predicate {
+    return createPredicate(this.filters, this.queryType);
   }
 }
+
+// ============================================================================
+// Query Builder Helpers
+// ============================================================================
+
+/**
+ * Create a token balance query predicate
+ * Finds wallets holding tokens within the specified balance range
+ */
+export function createTokenBalanceQuery(
+  tokenMintBytes: Uint8Array,
+  minBalance?: bigint,
+  maxBalance?: bigint
+): Predicate {
+  const filters: Filter[] = [];
+
+  // Token mint as first 8 bytes (truncated for storage in u64)
+  const mintValue = bytesToBigInt(tokenMintBytes.slice(0, 8));
+  filters.push({ type: FilterType.TOKEN_MINT, op: FilterOp.EQ, value: mintValue });
+
+  if (minBalance !== undefined) {
+    filters.push({ type: FilterType.MIN_BALANCE, op: FilterOp.GTE, value: minBalance });
+  }
+  if (maxBalance !== undefined) {
+    filters.push({ type: FilterType.MAX_BALANCE, op: FilterOp.LTE, value: maxBalance });
+  }
+
+  return { queryType: QueryType.TOKEN_BALANCE, filters };
+}
+
+/**
+ * Create a token ownership query predicate
+ * Finds all holders of a specific token
+ */
+export function createTokenOwnershipQuery(
+  tokenMintBytes: Uint8Array
+): Predicate {
+  const mintValue = bytesToBigInt(tokenMintBytes.slice(0, 8));
+  return {
+    queryType: QueryType.TOKEN_OWNERSHIP,
+    filters: [{ type: FilterType.TOKEN_MINT, op: FilterOp.EQ, value: mintValue }],
+  };
+}
+
+/**
+ * Create a transaction lookup query predicate
+ * Checks if a wallet has interacted with a program
+ */
+export function createTxLookupQuery(
+  walletBytes: Uint8Array,
+  programBytes?: Uint8Array,
+  options?: { afterSlot?: bigint; beforeSlot?: bigint }
+): Predicate {
+  const filters: Filter[] = [];
+
+  const walletValue = bytesToBigInt(walletBytes.slice(0, 8));
+  filters.push({ type: FilterType.WALLET_ADDRESS, op: FilterOp.EQ, value: walletValue });
+
+  if (programBytes) {
+    const programValue = bytesToBigInt(programBytes.slice(0, 8));
+    filters.push({ type: FilterType.PROGRAM_ID, op: FilterOp.EQ, value: programValue });
+  }
+
+  if (options?.afterSlot !== undefined) {
+    filters.push({ type: FilterType.AFTER_SLOT, op: FilterOp.GTE, value: options.afterSlot });
+  }
+  if (options?.beforeSlot !== undefined) {
+    filters.push({ type: FilterType.BEFORE_SLOT, op: FilterOp.LTE, value: options.beforeSlot });
+  }
+
+  return { queryType: QueryType.TX_LOOKUP, filters };
+}
+
+/**
+ * Convert first 8 bytes to bigint (LE)
+ */
+function bytesToBigInt(bytes: Uint8Array): bigint {
+  let value = 0n;
+  for (let i = 0; i < Math.min(8, bytes.length); i++) {
+    value |= BigInt(bytes[i]) << BigInt(i * 8);
+  }
+  return value;
+}
+
+export { QueryType, FilterType, FilterOp } from "./types";

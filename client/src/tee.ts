@@ -276,19 +276,21 @@ export async function isDelegated(
 }
 
 /**
- * Wait for an account to appear on L1 (after commit)
+ * Wait for an account to meet a condition
  */
 export async function waitForCommit(
   connection: Connection,
   accountPubkey: PublicKey,
   timeoutMs: number = 30000,
-  pollIntervalMs: number = 1000
+  pollIntervalMs: number = 1000,
+  condition?: (accountInfo: { data: Buffer } | null) => Promise<boolean> | boolean
 ): Promise<boolean> {
   const startTime = Date.now();
+  const checkCondition = condition || ((info) => info !== null && info.data.length > 0);
 
   while (Date.now() - startTime < timeoutMs) {
     const accountInfo = await connection.getAccountInfo(accountPubkey);
-    if (accountInfo && accountInfo.data.length > 0) {
+    if (await checkCondition(accountInfo)) {
       return true;
     }
     await sleep(pollIntervalMs);

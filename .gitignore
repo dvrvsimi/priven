@@ -1,5 +1,6 @@
 packages/
 docs/
+demo/
 source/
 target/
 **/*.rs.bk
@@ -17,3 +18,5 @@ artifacts/
 .anchor
 **/dist/
 SCRIPT.md
+.privenrc
+.g

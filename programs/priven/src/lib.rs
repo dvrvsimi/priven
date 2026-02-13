@@ -1,99 +1,48 @@
 use anchor_lang::prelude::*;
-use ephemeral_rollups_sdk::anchor::{action, commit, delegate, ephemeral};
+use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
 use ephemeral_rollups_sdk::ephem::commit_and_undelegate_accounts;
-
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
-use hkdf::Hkdf;
-use sha2::Sha256;
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 declare_id!("EMqLDAtqv5QPpBDk4fQtFDps7cXeWp1goNbra8fNWXaM");
 
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
 /// Maximum pools per query
-pub const MAX_POOLS: usize = 5;
+pub const MAX_POOLS: usize = 20;
 
-/// Maximum filters in predicate
-pub const MAX_FILTERS: usize = 4;
-
-/// Size of each filter: type(1) + op(1) + field(1) + value(8) = 11 bytes
-pub const FILTER_SIZE: usize = 11;
-
-/// Predicate plaintext size: version(1) + count(1) + filters(11*4) = 46 bytes
-pub const PREDICATE_V2_PLAINTEXT_SIZE: usize = 46;
-
-/// Size of AES-GCM encrypted predicate: ~48 bytes ciphertext + 12 nonce + 16 tag = 76, rounded to 80
+/// Size of AES-GCM encrypted predicate
 pub const ENCRYPTED_PREDICATE_SIZE: usize = 80;
 
-/// Legacy predicate size (for backward compatibility)
-pub const ENCRYPTED_PREDICATE_SIZE_V1: usize = 44;
-
-/// Size of encrypted result: 1 byte count + (32 * 5) addresses + 12 nonce + 16 tag
-pub const ENCRYPTED_RESULT_SIZE: usize = 189;
-
-// ============================================================================
-// FILTER TYPES AND OPERATIONS (V2 Predicate Schema)
-// ============================================================================
-
-/// Filter types for predicate evaluation
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum FilterType {
-    Tvl = 0,
-    Balance = 1,
-    Volume24h = 2,
-    FeeRate = 3,
-    Price = 4,
-    Apy = 5,
-    ReserveA = 6,
-    ReserveB = 7,
-    Ratio = 8,
-    Mint = 9,
-    Program = 10,
-    SlotAge = 11,
-}
-
-/// Filter comparison operations
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum FilterOp {
-    Gte = 0, // >=
-    Lte = 1, // <=
-    Eq = 2,  // ==
-    Neq = 3, // !=
-}
-
-/// Single filter in V2 predicate (11 bytes)
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, Debug)]
-pub struct Filter {
-    pub filter_type: u8,
-    pub op: u8,
-    pub field: u8, // Reserved for future use
-    pub value: u64,
-}
-
-/// Parsed V2 predicate structure
-pub struct PredicateV2 {
-    pub version: u8,
-    pub filter_count: u8,
-    pub filters: [Filter; MAX_FILTERS],
-}
+/// Maximum encrypted result size: count(1) + MAX_POOLS * 32 + nonce(12) + tag(16) = 669
+pub const MAX_ENCRYPTED_RESULT_SIZE: usize = 1 + MAX_POOLS * 32 + 28;
 
 /// Query state seed
 pub const QUERY_SEED: &[u8] = b"query";
 
-/// Result seed
-pub const RESULT_SEED: &[u8] = b"result";
-
 /// Config seed
 pub const CONFIG_SEED: &[u8] = b"config";
+
+/// Session seed
+pub const SESSION_SEED: &[u8] = b"session";
+
+/// Merkle anchor seed
+pub const ANCHOR_SEED: &[u8] = b"anchor";
+
+/// Session timeout (1 hour)
+pub const SESSION_TIMEOUT_SECONDS: i64 = 3600;
+
+/// Query timeout (1 hour)
+pub const QUERY_TIMEOUT_SECONDS: i64 = 3600;
 
 #[ephemeral]
 #[program]
 pub mod priven {
     use super::*;
+
+    // ========================================================================
+    // CONFIG INSTRUCTIONS
+    // ========================================================================
 
     /// Initialize program configuration
     pub fn initialize(
@@ -107,199 +56,8 @@ pub mod priven {
         config.tee_validator = tee_validator;
         config.max_pools = max_pools;
         config.query_fee = query_fee;
+        config.total_queries = 0;
         config.bump = ctx.bumps.config;
-        Ok(())
-    }
-
-    /// Submit a new query (creates QueryState)
-    pub fn submit_query(
-        ctx: Context<SubmitQuery>,
-        query_id: u64,
-        encrypted_predicate: [u8; ENCRYPTED_PREDICATE_SIZE],
-        user_pubkey: [u8; 32],
-        pools: Vec<PoolData>,
-    ) -> Result<()> {
-        require!(!pools.is_empty(), PrivenError::NoPoolsProvided);
-        require!(pools.len() <= MAX_POOLS, PrivenError::TooManyPools);
-
-        let query_state = &mut ctx.accounts.query_state;
-        query_state.owner = ctx.accounts.user.key();
-        query_state.query_id = query_id;
-        query_state.encrypted_predicate = encrypted_predicate;
-        query_state.user_pubkey = user_pubkey;
-        query_state.status = QueryStatus::Pending;
-        query_state.pool_count = pools.len() as u8;
-        query_state.submitted_at = Clock::get()?.unix_timestamp;
-        query_state.bump = ctx.bumps.query_state;
-
-        for (i, pool) in pools.iter().enumerate() {
-            query_state.pools[i] = *pool;
-        }
-
-        // Emit event for indexers
-        emit!(QuerySubmitted {
-            query_id,
-            owner: ctx.accounts.user.key(),
-            pool_count: pools.len() as u8,
-        });
-
-        Ok(())
-    }
-
-    /// Delegate query state to TEE validator for private execution
-    pub fn delegate_query(ctx: Context<DelegateQuery>, query_id: u64) -> Result<()> {
-        // CPI to delegation program - transfers account ownership
-        ctx.accounts.delegate_query_state(
-            &ctx.accounts.user,
-            &[QUERY_SEED, ctx.accounts.user.key().as_ref(), &query_id.to_le_bytes()],
-            ephemeral_rollups_sdk::cpi::DelegateConfig::default(),
-        )?;
-
-        emit!(QueryDelegated {
-            query_id,
-            owner: ctx.accounts.user.key(),
-        });
-
-        Ok(())
-    }
-
-    /// Execute query inside TEE (runs in trusted enclave)
-    pub fn execute_query(ctx: Context<ExecuteQuery>, decryption_key: [u8; 32]) -> Result<()> {
-        let query_state = &mut ctx.accounts.query_state;
-        let query_result = &mut ctx.accounts.query_result;
-
-        require!(
-            query_state.status == QueryStatus::Delegated,
-            PrivenError::QueryNotDelegated
-        );
-
-        query_state.status = QueryStatus::Executing;
-
-        let (encrypted_result, encrypted_len, success) = execute_private_query(
-            &query_state.encrypted_predicate,
-            &decryption_key,
-            &query_state.user_pubkey,
-            &query_state.pools[..query_state.pool_count as usize],
-        );
-
-        query_result.owner = query_state.owner;
-        query_result.query_id = query_state.query_id;
-        query_result.encrypted_result = encrypted_result;
-        query_result.encrypted_len = encrypted_len;
-        query_result.completed_slot = Clock::get()?.slot;
-        query_result.success = success;
-        query_result.bump = ctx.bumps.query_result;
-
-        query_state.status = if success {
-            QueryStatus::Completed
-        } else {
-            QueryStatus::Failed
-        };
-
-        // Extract match count from encrypted result (first byte of plaintext before encryption)
-        let match_count = if encrypted_len > 0 { encrypted_result[0] } else { 0 };
-
-        emit!(QueryExecuted {
-            query_id: query_state.query_id,
-            owner: query_state.owner,
-            success,
-            match_count,
-            encrypted_result: encrypted_result.to_vec(),
-            encrypted_len,
-        });
-
-        Ok(())
-    }
-
-    /// Execute query in stateless mode - result stored in QueryState for Magic Actions
-    /// This is the TEE-friendly version that only writes to query_state (already delegated)
-    /// Runs on Ephemeral Rollup - the fact we can access/modify the account proves delegation
-    pub fn execute_query_stateless(
-        ctx: Context<ExecuteQueryStateless>,
-        decryption_key: [u8; 32],
-        _owner: Pubkey,  // For PDA derivation
-        _query_id: u64,  // For PDA derivation
-    ) -> Result<()> {
-        let query_state = &mut ctx.accounts.query_state;
-
-        // Status is Pending when delegated (delegation only changes owner, not data)
-        // On ER, we can write to this account because it was delegated
-        // On L1 after delegation, this would fail because delegation program owns it
-        require!(
-            query_state.status == QueryStatus::Pending,
-            PrivenError::QueryNotDelegated
-        );
-
-        query_state.status = QueryStatus::Executing;
-
-        let (encrypted_result, encrypted_len, success) = execute_private_query(
-            &query_state.encrypted_predicate,
-            &decryption_key,
-            &query_state.user_pubkey,
-            &query_state.pools[..query_state.pool_count as usize],
-        );
-
-        // Store result in QueryState for Magic Actions commit
-        query_state.encrypted_result = encrypted_result;
-        query_state.encrypted_len = encrypted_len;
-        query_state.execution_success = success;
-
-        query_state.status = if success {
-            QueryStatus::Completed
-        } else {
-            QueryStatus::Failed
-        };
-
-        let match_count = if encrypted_len > 0 { encrypted_result[0] } else { 0 };
-
-        // Emit result in event (for immediate client access)
-        emit!(QueryExecuted {
-            query_id: query_state.query_id,
-            owner: query_state.owner,
-            success,
-            match_count,
-            encrypted_result: encrypted_result[..encrypted_len as usize].to_vec(),
-            encrypted_len,
-        });
-
-        Ok(())
-    }
-
-    /// Commit and undelegate query state back to L1
-    /// This must be called after execute_query_stateless to persist changes
-    pub fn undelegate_query(
-        ctx: Context<UndelegateQuery>,
-        _owner: Pubkey,   // For PDA derivation
-        _query_id: u64,   // For PDA derivation
-    ) -> Result<()> {
-        commit_and_undelegate_accounts(
-            &ctx.accounts.payer,
-            vec![&ctx.accounts.query_state.to_account_info()],
-            &ctx.accounts.magic_context,
-            &ctx.accounts.magic_program,
-        )?;
-
-        Ok(())
-    }
-
-    /// Commit result and undelegate back to L1
-    pub fn commit_result(ctx: Context<CommitResult>) -> Result<()> {
-        let query_state = &mut ctx.accounts.query_state;
-        let query_result = &ctx.accounts.query_result;
-
-        // Validate result matches query
-        require!(
-            query_result.query_id == query_state.query_id,
-            PrivenError::QueryMismatch
-        );
-
-        emit!(QueryCompleted {
-            query_id: query_state.query_id,
-            owner: query_state.owner,
-            success: query_result.success,
-            result_slot: query_result.completed_slot,
-        });
-
         Ok(())
     }
 
@@ -325,28 +83,235 @@ pub mod priven {
         Ok(())
     }
 
-    /// Expire a stuck query after timeout (1 hour)
-    /// Anyone can call this to clean up expired queries
-    pub fn expire_query(ctx: Context<ExpireQuery>) -> Result<()> {
-        let query_state = &mut ctx.accounts.query_state;
+    /// Close config account and return rent to admin (for migration)
+    pub fn close_config(ctx: Context<CloseConfig>) -> Result<()> {
+        let config_info = &ctx.accounts.config;
+        let admin = &ctx.accounts.admin;
+
+        // Verify config account has data
+        let config_data = config_info.try_borrow_data()?;
+        require!(config_data.len() >= 40, PrivenError::InvalidConfig); // 8 discriminator + 32 admin
+
+        // Verify admin is the first pubkey after discriminator
+        let stored_admin = Pubkey::try_from(&config_data[8..40]).map_err(|_| PrivenError::InvalidConfig)?;
+        require!(stored_admin == admin.key(), PrivenError::Unauthorized);
+        drop(config_data);
+
+        // Transfer lamports and zero account
+        let lamports = config_info.lamports();
+        **config_info.try_borrow_mut_lamports()? = 0;
+        **admin.try_borrow_mut_lamports()? = admin.lamports().checked_add(lamports).unwrap();
+
+        // Zero the data to mark as closed
+        let mut data = config_info.try_borrow_mut_data()?;
+        data.fill(0);
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // SESSION INSTRUCTIONS
+    // ========================================================================
+
+    /// Open a new query session
+    pub fn open_session(ctx: Context<OpenSession>, session_id: u64) -> Result<()> {
+        let session = &mut ctx.accounts.session;
+        session.owner = ctx.accounts.user.key();
+        session.session_id = session_id;
+        session.created_at = Clock::get()?.unix_timestamp;
+        session.last_query_at = 0;
+        session.query_count = 0;
+        session.bump = ctx.bumps.session;
+
+        emit!(SessionOpened {
+            session_id,
+            owner: ctx.accounts.user.key(),
+        });
+
+        Ok(())
+    }
+
+    /// Close a session and return rent to owner
+    pub fn close_session(ctx: Context<CloseSession>) -> Result<()> {
+        emit!(SessionClosed {
+            session_id: ctx.accounts.session.session_id,
+            owner: ctx.accounts.session.owner,
+            query_count: ctx.accounts.session.query_count,
+        });
+        Ok(())
+    }
+
+    /// Expire an idle session after timeout (permissionless)
+    pub fn expire_session(ctx: Context<ExpireSession>) -> Result<()> {
+        let session = &ctx.accounts.session;
         let clock = Clock::get()?;
 
-        // 1 hour timeout in seconds
-        const QUERY_TIMEOUT_SECONDS: i64 = 3600;
+        require!(
+            clock.unix_timestamp > session.created_at + SESSION_TIMEOUT_SECONDS,
+            PrivenError::SessionNotExpired
+        );
+
+        emit!(SessionExpired {
+            session_id: session.session_id,
+            owner: session.owner,
+        });
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // QUERY INSTRUCTIONS
+    // ========================================================================
+
+    /// Submit a new query within a session
+    pub fn submit_query(
+        ctx: Context<SubmitQuery>,
+        session_id: u64,
+        query_id: u64,
+        encrypted_predicate: [u8; ENCRYPTED_PREDICATE_SIZE],
+        user_pubkey: [u8; 32],
+        pool_addresses: Vec<Pubkey>,
+    ) -> Result<()> {
+        require!(!pool_addresses.is_empty(), PrivenError::NoPoolsProvided);
+        require!(
+            pool_addresses.len() <= ctx.accounts.config.max_pools as usize,
+            PrivenError::TooManyPools
+        );
+
+        let query_state = &mut ctx.accounts.query_state;
+        query_state.owner = ctx.accounts.user.key();
+        query_state.session_id = session_id;
+        query_state.query_id = query_id;
+        query_state.encrypted_predicate = encrypted_predicate;
+        query_state.user_pubkey = user_pubkey;
+        query_state.status = QueryStatus::Pending;
+        query_state.pool_count = pool_addresses.len() as u8;
+        query_state.pool_addresses = pool_addresses.clone();
+        query_state.submitted_at = Clock::get()?.unix_timestamp;
+        query_state.bump = ctx.bumps.query_state;
+
+        // Update global query count
+        ctx.accounts.config.total_queries += 1;
+
+        emit!(QuerySubmitted {
+            session_id,
+            query_id,
+            owner: ctx.accounts.user.key(),
+            pool_count: query_state.pool_count,
+        });
+
+        Ok(())
+    }
+
+    /// Delegate query state to TEE validator for private execution
+    pub fn delegate_query(ctx: Context<DelegateQuery>, query_id: u64) -> Result<()> {
+        ctx.accounts.delegate_query_state(
+            &ctx.accounts.user,
+            &[QUERY_SEED, ctx.accounts.user.key().as_ref(), &query_id.to_le_bytes()],
+            ephemeral_rollups_sdk::cpi::DelegateConfig::default(),
+        )?;
+
+        emit!(QueryDelegated {
+            query_id,
+            owner: ctx.accounts.user.key(),
+        });
+
+        Ok(())
+    }
+
+    /// Commit and undelegate query state back to L1
+    pub fn undelegate_query(
+        ctx: Context<UndelegateQuery>,
+        _owner: Pubkey,
+        _query_id: u64,
+    ) -> Result<()> {
+        commit_and_undelegate_accounts(
+            &ctx.accounts.payer,
+            vec![&ctx.accounts.query_state.to_account_info()],
+            &ctx.accounts.magic_context,
+            &ctx.accounts.magic_program,
+        )?;
+
+        Ok(())
+    }
+
+    /// Submit result from TEE executor
+    pub fn submit_result(
+        ctx: Context<SubmitResult>,
+        encrypted_result: Vec<u8>,
+        match_count: u8,
+        success: bool,
+        result_hash: [u8; 32],
+        _owner: Pubkey,
+        _query_id: u64,
+    ) -> Result<()> {
+        // Verify caller is the authorized TEE validator
+        require!(
+            ctx.accounts.caller.key() == ctx.accounts.config.tee_validator,
+            PrivenError::UnauthorizedTeeValidator
+        );
+
+        // Validate encrypted result size
+        require!(
+            encrypted_result.len() <= MAX_ENCRYPTED_RESULT_SIZE,
+            PrivenError::ResultTooLarge
+        );
+
+        let query_state = &mut ctx.accounts.query_state;
+
+        require!(
+            query_state.status == QueryStatus::Pending || query_state.status == QueryStatus::Delegated,
+            PrivenError::InvalidQueryStatus
+        );
+
+        // If session_id != 0, session account must be provided
+        if query_state.session_id != 0 {
+            require!(
+                ctx.accounts.session.is_some(),
+                PrivenError::SessionRequired
+            );
+        }
+
+        query_state.status = if success {
+            QueryStatus::Completed
+        } else {
+            QueryStatus::Failed
+        };
+
+        // Update session stats if session account provided
+        if let Some(session) = &mut ctx.accounts.session {
+            session.query_count += 1;
+            session.last_query_at = Clock::get()?.unix_timestamp;
+        }
+
+        emit!(QueryExecuted {
+            session_id: query_state.session_id,
+            query_id: query_state.query_id,
+            owner: query_state.owner,
+            success,
+            match_count,
+            encrypted_result,
+            result_hash,
+        });
+
+        Ok(())
+    }
+
+    /// Expire a stuck query after timeout, returns rent to owner
+    pub fn expire_query(ctx: Context<ExpireQuery>) -> Result<()> {
+        let query_state = &ctx.accounts.query_state;
+        let clock = Clock::get()?;
 
         require!(
             clock.unix_timestamp > query_state.submitted_at + QUERY_TIMEOUT_SECONDS,
             PrivenError::QueryNotExpired
         );
 
-        // Only expire if not already completed/failed
         require!(
             query_state.status != QueryStatus::Completed
                 && query_state.status != QueryStatus::Failed,
             PrivenError::InvalidQueryStatus
         );
-
-        query_state.status = QueryStatus::Failed;
 
         emit!(QueryExpired {
             query_id: query_state.query_id,
@@ -356,119 +321,51 @@ pub mod priven {
         Ok(())
     }
 
-    // ========================================================================
-    // MAGIC ACTIONS - Atomic L1 execution after TEE commit
-    // ========================================================================
-
-    /// Write result action - runs on L1 after TEE commits QueryState
-    /// This is the #[action] that creates QueryResult atomically
-    pub fn write_result_action(ctx: Context<WriteResultAction>) -> Result<()> {
-        let query_state = &ctx.accounts.query_state;
-        let query_result = &mut ctx.accounts.query_result;
-
-        // Copy encrypted result from committed QueryState to new QueryResult
-        query_result.owner = query_state.owner;
-        query_result.query_id = query_state.query_id;
-        query_result.encrypted_result = query_state.encrypted_result;
-        query_result.encrypted_len = query_state.encrypted_len;
-        query_result.completed_slot = Clock::get()?.slot;
-        query_result.success = query_state.execution_success;
-        query_result.bump = ctx.bumps.query_result;
-
-        emit!(QueryCompleted {
-            query_id: query_state.query_id,
-            owner: query_state.owner,
-            success: query_state.execution_success,
-            result_slot: query_result.completed_slot,
+    /// Close completed/failed query, return rent to owner
+    pub fn close_query(ctx: Context<CloseQuery>) -> Result<()> {
+        emit!(QueryClosed {
+            query_id: ctx.accounts.query_state.query_id,
+            owner: ctx.accounts.query_state.owner,
         });
-
-        Ok(())
-    }
-
-    /// Commit and write result - schedules TEE commit + L1 action atomically
-    /// Called from ephemeral rollup after execute_query_stateless
-    pub fn commit_and_write_result(ctx: Context<CommitAndWriteResult>) -> Result<()> {
-        let query_state = &ctx.accounts.query_state;
-
-        require!(
-            query_state.status == QueryStatus::Completed || query_state.status == QueryStatus::Failed,
-            PrivenError::InvalidQueryStatus
-        );
-
-        // The #[commit] macro handles scheduling the commit
-        // The action will run on L1 after commit completes
-
-        msg!("Scheduling commit with write_result_action");
-        msg!("Query ID: {}, Success: {}", query_state.query_id, query_state.execution_success);
-
         Ok(())
     }
 
     // ========================================================================
-    // SPLIT ARCHITECTURE: Native TEE Service submits pre-computed results
+    // MERKLE ANCHORING INSTRUCTIONS
     // ========================================================================
 
-    /// Submit result from native TEE service (no crypto on-chain!)
-    ///
-    /// This is the key to avoiding compute unit limits:
-    /// - Crypto runs NATIVELY in TEE service (x86, no CU limit)
-    /// - On-chain instruction just stores the pre-computed result
-    /// - Uses ~10k CUs instead of 1.4M+
-    ///
-    /// Flow:
-    /// 1. TEE service fetches QueryState via RPC
-    /// 2. TEE service decrypts predicate (native x86)
-    /// 3. TEE service evaluates pools (native x86)
-    /// 4. TEE service encrypts result (native x86)
-    /// 5. TEE service calls this instruction to store result
-    pub fn submit_result(
-        ctx: Context<SubmitResult>,
-        encrypted_result: [u8; ENCRYPTED_RESULT_SIZE],
-        encrypted_len: u16,
-        success: bool,
-        _owner: Pubkey,  // For PDA derivation
-        _query_id: u64,  // For PDA derivation
+    /// Initialize Merkle anchor (admin only)
+    pub fn initialize_anchor(ctx: Context<InitializeAnchor>) -> Result<()> {
+        let anchor = &mut ctx.accounts.anchor;
+        anchor.authority = ctx.accounts.admin.key();
+        anchor.latest_root = [0u8; 32];
+        anchor.query_count = 0;
+        anchor.anchor_slot = 0;
+        anchor.epoch = 0;
+        anchor.bump = ctx.bumps.anchor;
+        Ok(())
+    }
+
+    /// Post Merkle root batch (TEE operator only)
+    pub fn anchor_batch(
+        ctx: Context<AnchorBatch>,
+        merkle_root: [u8; 32],
+        query_count: u64,
     ) -> Result<()> {
-        let query_state = &mut ctx.accounts.query_state;
+        let anchor = &mut ctx.accounts.anchor;
+        let clock = Clock::get()?;
 
-        // Verify query is in a valid state for result submission
-        // Accept both Pending (fresh) and Delegated states
-        require!(
-            query_state.status == QueryStatus::Pending || query_state.status == QueryStatus::Delegated,
-            PrivenError::InvalidQueryStatus
-        );
+        anchor.latest_root = merkle_root;
+        anchor.query_count = query_count;
+        anchor.anchor_slot = clock.slot;
+        anchor.epoch += 1;
 
-        query_state.encrypted_result = encrypted_result;
-        query_state.encrypted_len = encrypted_len;
-        query_state.execution_success = success;
-        query_state.status = if success {
-            QueryStatus::Completed
-        } else {
-            QueryStatus::Failed
-        };
-
-        // Extract match count from result (first byte after decryption would be count)
-        // For encrypted data, we can't read it, but the caller passed success flag
-        let match_count = if encrypted_len > 0 && success {
-            // Encrypted result format: [ciphertext][nonce:12][tag:16]
-            // We can't read plaintext here, but TEE executor knows the count
-            0u8 // Will be updated when we have attestation
-        } else {
-            0
-        };
-
-        emit!(QueryExecuted {
-            query_id: query_state.query_id,
-            owner: query_state.owner,
-            success,
-            match_count,
-            encrypted_result: encrypted_result[..encrypted_len as usize].to_vec(),
-            encrypted_len,
+        emit!(BatchAnchored {
+            epoch: anchor.epoch,
+            merkle_root,
+            query_count,
+            slot: anchor.anchor_slot,
         });
-
-        msg!("Result submitted by TEE executor");
-        msg!("Query ID: {}, Success: {}, Encrypted len: {}",
-            query_state.query_id, success, encrypted_len);
 
         Ok(())
     }
@@ -496,7 +393,79 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(query_id: u64)]
+pub struct UpdateConfig<'info> {
+    #[account(constraint = admin.key() == config.admin @ PrivenError::Unauthorized)]
+    pub admin: Signer<'info>,
+
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, QueryConfig>,
+}
+
+/// Close config account - uses UncheckedAccount to handle size mismatch during migration
+#[derive(Accounts)]
+pub struct CloseConfig<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    /// CHECK: Config account that may have incorrect size due to migration.
+    /// We manually verify the admin is the first 32 bytes of account data (after discriminator).
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED],
+        bump,
+    )]
+    pub config: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(session_id: u64)]
+pub struct OpenSession<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        init,
+        payer = user,
+        space = 8 + QuerySession::INIT_SPACE,
+        seeds = [SESSION_SEED, user.key().as_ref(), &session_id.to_le_bytes()],
+        bump
+    )]
+    pub session: Account<'info, QuerySession>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CloseSession<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        close = owner,
+        has_one = owner,
+    )]
+    pub session: Account<'info, QuerySession>,
+}
+
+#[derive(Accounts)]
+pub struct ExpireSession<'info> {
+    pub caller: Signer<'info>,
+
+    /// CHECK: Receives rent refund
+    #[account(mut)]
+    pub owner: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        close = owner,
+        constraint = session.owner == owner.key() @ PrivenError::Unauthorized
+    )]
+    pub session: Account<'info, QuerySession>,
+}
+
+#[derive(Accounts)]
+#[instruction(session_id: u64, query_id: u64)]
 pub struct SubmitQuery<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
@@ -510,7 +479,7 @@ pub struct SubmitQuery<'info> {
     )]
     pub query_state: Account<'info, QueryState>,
 
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, QueryConfig>,
 
     pub system_program: Program<'info, System>,
@@ -533,54 +502,6 @@ pub struct DelegateQuery<'info> {
     pub query_state: AccountInfo<'info>,
 }
 
-/// Execute query - runs inside TEE ephemeral rollup
-#[derive(Accounts)]
-pub struct ExecuteQuery<'info> {
-    /// Payer for result account creation
-    #[account(mut)]
-    pub payer: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [QUERY_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
-        bump = query_state.bump,
-    )]
-    pub query_state: Account<'info, QueryState>,
-
-    #[account(
-        init_if_needed,
-        payer = payer,
-        space = 8 + QueryResult::INIT_SPACE,
-        seeds = [RESULT_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
-        bump
-    )]
-    pub query_result: Account<'info, QueryResult>,
-
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, QueryConfig>,
-
-    pub system_program: Program<'info, System>,
-}
-
-/// Execute query stateless - TEE-friendly version that only writes to query_state
-/// Result is emitted in QueryExecuted event, no result account needed
-/// NOTE: No config account - TEE authorization is implicit via delegation
-#[derive(Accounts)]
-#[instruction(decryption_key: [u8; 32], owner: Pubkey, query_id: u64)]
-pub struct ExecuteQueryStateless<'info> {
-    /// Caller (TEE validator or authorized executor)
-    #[account(mut)]
-    pub caller: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [QUERY_SEED, owner.as_ref(), &query_id.to_le_bytes()],
-        bump,
-    )]
-    pub query_state: Account<'info, QueryState>,
-}
-
-/// Commit and undelegate query state back to L1
 #[commit]
 #[derive(Accounts)]
 #[instruction(owner: Pubkey, query_id: u64)]
@@ -602,111 +523,97 @@ pub struct UndelegateQuery<'info> {
     pub magic_program: AccountInfo<'info>,
 }
 
-#[commit]
 #[derive(Accounts)]
-pub struct CommitResult<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [QUERY_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
-        bump = query_state.bump
-    )]
-    pub query_state: Account<'info, QueryState>,
-
-    #[account(
-        mut,
-        seeds = [RESULT_SEED, query_result.owner.as_ref(), &query_result.query_id.to_le_bytes()],
-        bump = query_result.bump
-    )]
-    pub query_result: Account<'info, QueryResult>,
-}
-
-#[derive(Accounts)]
-pub struct UpdateConfig<'info> {
-    #[account(constraint = admin.key() == config.admin @ PrivenError::Unauthorized)]
-    pub admin: Signer<'info>,
-
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, QueryConfig>,
-}
-
-#[derive(Accounts)]
-pub struct ExpireQuery<'info> {
-    /// Anyone can expire a stuck query
-    pub caller: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [QUERY_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
-        bump = query_state.bump
-    )]
-    pub query_state: Account<'info, QueryState>,
-}
-
-// ============================================================================
-// MAGIC ACTIONS CONTEXTS
-// ============================================================================
-
-/// Action context - runs on L1 after commit, creates QueryResult
-#[action]
-#[derive(Accounts)]
-pub struct WriteResultAction<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-
-    /// QueryState with committed result data
-    #[account(
-        seeds = [QUERY_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
-        bump = query_state.bump
-    )]
-    pub query_state: Account<'info, QueryState>,
-
-    /// QueryResult to be created on L1
-    #[account(
-        init,
-        payer = payer,
-        space = 8 + QueryResult::INIT_SPACE,
-        seeds = [RESULT_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
-        bump
-    )]
-    pub query_result: Account<'info, QueryResult>,
-
-    pub system_program: Program<'info, System>,
-}
-
-/// Commit context - schedules commit + write_result_action
-#[commit]
-#[derive(Accounts)]
-pub struct CommitAndWriteResult<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [QUERY_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
-        bump = query_state.bump
-    )]
-    pub query_state: Account<'info, QueryState>,
-}
-
-/// Submit result from native TEE executor (no crypto on-chain)
-/// This is the split architecture - crypto runs natively in TEE service
-#[derive(Accounts)]
-#[instruction(encrypted_result: [u8; ENCRYPTED_RESULT_SIZE], encrypted_len: u16, success: bool, owner: Pubkey, query_id: u64)]
+#[instruction(encrypted_result: Vec<u8>, match_count: u8, success: bool, result_hash: [u8; 32], owner: Pubkey, query_id: u64)]
 pub struct SubmitResult<'info> {
-    /// TEE executor or authorized caller
     #[account(mut)]
     pub caller: Signer<'info>,
 
-    /// QueryState to store result in
     #[account(
         mut,
         seeds = [QUERY_SEED, owner.as_ref(), &query_id.to_le_bytes()],
         bump,
     )]
     pub query_state: Account<'info, QueryState>,
+
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, QueryConfig>,
+
+    /// Optional session account to update stats
+    #[account(
+        mut,
+        seeds = [SESSION_SEED, owner.as_ref(), &query_state.session_id.to_le_bytes()],
+        bump = session.bump,
+    )]
+    pub session: Option<Account<'info, QuerySession>>,
+}
+
+#[derive(Accounts)]
+pub struct ExpireQuery<'info> {
+    pub caller: Signer<'info>,
+
+    /// CHECK: Rent destination
+    #[account(mut)]
+    pub owner: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        close = owner,
+        seeds = [QUERY_SEED, query_state.owner.as_ref(), &query_state.query_id.to_le_bytes()],
+        bump = query_state.bump,
+        constraint = query_state.owner == owner.key() @ PrivenError::Unauthorized
+    )]
+    pub query_state: Account<'info, QueryState>,
+}
+
+#[derive(Accounts)]
+pub struct CloseQuery<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        close = owner,
+        has_one = owner,
+        constraint = query_state.status == QueryStatus::Completed
+            || query_state.status == QueryStatus::Failed @ PrivenError::InvalidQueryStatus
+    )]
+    pub query_state: Account<'info, QueryState>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeAnchor<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, QueryConfig>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + MerkleAnchor::INIT_SPACE,
+        seeds = [ANCHOR_SEED],
+        bump
+    )]
+    pub anchor: Account<'info, MerkleAnchor>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AnchorBatch<'info> {
+    #[account(
+        constraint = caller.key() == anchor.authority @ PrivenError::Unauthorized
+    )]
+    pub caller: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANCHOR_SEED],
+        bump = anchor.bump,
+    )]
+    pub anchor: Account<'info, MerkleAnchor>,
 }
 
 // ============================================================================
@@ -716,55 +623,50 @@ pub struct SubmitResult<'info> {
 #[account]
 #[derive(InitSpace)]
 pub struct QueryConfig {
-    pub admin: Pubkey,
-    pub tee_validator: Pubkey,
-    pub max_pools: u8,
-    pub query_fee: u64, // Reserved for future use, not enforced
-    pub bump: u8,
+    pub admin: Pubkey,         // 32
+    pub tee_validator: Pubkey, // 32
+    pub max_pools: u8,         // 1
+    pub query_fee: u64,        // 8
+    pub total_queries: u64,    // 8
+    pub bump: u8,              // 1
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct QuerySession {
+    pub owner: Pubkey,      // 32
+    pub session_id: u64,    // 8
+    pub created_at: i64,    // 8
+    pub last_query_at: i64, // 8
+    pub query_count: u64,   // 8
+    pub bump: u8,           // 1
 }
 
 #[account]
 #[derive(InitSpace)]
 pub struct QueryState {
-    pub owner: Pubkey,
-    pub query_id: u64,
-    pub encrypted_predicate: [u8; ENCRYPTED_PREDICATE_SIZE],
-    pub user_pubkey: [u8; 32],
-    pub status: QueryStatus,
+    pub owner: Pubkey,                                        // 32
+    pub session_id: u64,                                      // 8
+    pub query_id: u64,                                        // 8
+    pub encrypted_predicate: [u8; ENCRYPTED_PREDICATE_SIZE],  // 80
+    pub user_pubkey: [u8; 32],                                // 32
+    pub status: QueryStatus,                                  // 1
     #[max_len(MAX_POOLS)]
-    pub pools: [PoolData; MAX_POOLS],
-    pub pool_count: u8,
-    pub submitted_at: i64,
-    pub bump: u8,
-    // Magic Actions: store result in QueryState for L1 commit
-    pub encrypted_result: [u8; ENCRYPTED_RESULT_SIZE],
-    pub encrypted_len: u16,
-    pub execution_success: bool,
+    pub pool_addresses: Vec<Pubkey>,                          // 4 + 32*n
+    pub pool_count: u8,                                       // 1
+    pub submitted_at: i64,                                    // 8
+    pub bump: u8,                                             // 1
 }
 
 #[account]
 #[derive(InitSpace)]
-pub struct QueryResult {
-    pub owner: Pubkey,
-    pub query_id: u64,
-    pub encrypted_result: [u8; ENCRYPTED_RESULT_SIZE],
-    pub encrypted_len: u16,
-    pub completed_slot: u64,
-    pub success: bool,
-    pub bump: u8,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace)]
-pub struct PoolData {
-    pub address: Pubkey,
-    pub token_a_reserve: u64,
-    pub token_b_reserve: u64,
-}
-
-impl PoolData {
-    pub fn tvl(&self) -> u64 {
-        self.token_a_reserve.saturating_add(self.token_b_reserve)
-    }
+pub struct MerkleAnchor {
+    pub authority: Pubkey,      // 32
+    pub latest_root: [u8; 32],  // 32
+    pub query_count: u64,       // 8
+    pub anchor_slot: u64,       // 8
+    pub epoch: u64,             // 8
+    pub bump: u8,               // 1
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Default, InitSpace)]
@@ -772,7 +674,6 @@ pub enum QueryStatus {
     #[default]
     Pending,
     Delegated,
-    Executing,
     Completed,
     Failed,
 }
@@ -785,26 +686,24 @@ pub enum QueryStatus {
 pub enum PrivenError {
     #[msg("No pools provided")]
     NoPoolsProvided,
-    #[msg("Too many pools (max 5)")]
+    #[msg("Too many pools")]
     TooManyPools,
     #[msg("Invalid query status for this operation")]
     InvalidQueryStatus,
-    #[msg("Query not delegated - must delegate before execution")]
-    QueryNotDelegated,
     #[msg("Unauthorized")]
     Unauthorized,
-    #[msg("Decryption failed - invalid ciphertext or key")]
-    DecryptionFailed,
-    #[msg("Invalid predicate format")]
-    InvalidPredicateFormat,
-    #[msg("Unsupported predicate version")]
-    UnsupportedPredicateVersion,
-    #[msg("Too many filters (max 4)")]
-    TooManyFilters,
-    #[msg("Query ID mismatch between state and result")]
-    QueryMismatch,
     #[msg("Query has not expired yet")]
     QueryNotExpired,
+    #[msg("Session has not expired yet")]
+    SessionNotExpired,
+    #[msg("Caller is not the authorized TEE validator")]
+    UnauthorizedTeeValidator,
+    #[msg("Encrypted result exceeds maximum size")]
+    ResultTooLarge,
+    #[msg("Session account required when session_id != 0")]
+    SessionRequired,
+    #[msg("Invalid config account")]
+    InvalidConfig,
 }
 
 // ============================================================================
@@ -812,7 +711,27 @@ pub enum PrivenError {
 // ============================================================================
 
 #[event]
+pub struct SessionOpened {
+    pub session_id: u64,
+    pub owner: Pubkey,
+}
+
+#[event]
+pub struct SessionClosed {
+    pub session_id: u64,
+    pub owner: Pubkey,
+    pub query_count: u64,
+}
+
+#[event]
+pub struct SessionExpired {
+    pub session_id: u64,
+    pub owner: Pubkey,
+}
+
+#[event]
 pub struct QuerySubmitted {
+    pub session_id: u64,
     pub query_id: u64,
     pub owner: Pubkey,
     pub pool_count: u8,
@@ -826,20 +745,19 @@ pub struct QueryDelegated {
 
 #[event]
 pub struct QueryExecuted {
+    pub session_id: u64,
     pub query_id: u64,
     pub owner: Pubkey,
     pub success: bool,
     pub match_count: u8,
-    pub encrypted_result: Vec<u8>,  // Encrypted result for stateless mode
-    pub encrypted_len: u16,
+    pub encrypted_result: Vec<u8>,
+    pub result_hash: [u8; 32],
 }
 
 #[event]
-pub struct QueryCompleted {
+pub struct QueryClosed {
     pub query_id: u64,
     pub owner: Pubkey,
-    pub success: bool,
-    pub result_slot: u64,
 }
 
 #[event]
@@ -848,289 +766,10 @@ pub struct QueryExpired {
     pub owner: Pubkey,
 }
 
-// ============================================================================
-// CRYPTO HELPERS (AES-256-GCM with X25519 ECDH)
-// ============================================================================
-
-/// HKDF info string for key derivation (must match client)
-const HKDF_INFO: &[u8] = b"priven-v1";
-
-/// Derive AES-256 key from X25519 shared secret using HKDF-SHA256
-fn derive_aes_key(shared_secret: &[u8; 32]) -> [u8; 32] {
-    let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; 32]), shared_secret);
-    let mut aes_key = [0u8; 32];
-    hkdf.expand(HKDF_INFO, &mut aes_key)
-        .expect("HKDF expand failed");
-    aes_key
-}
-
-/// Decrypt predicate using X25519 ECDH + AES-256-GCM
-fn decrypt_predicate(
-    encrypted: &[u8],
-    tee_private_key: &[u8; 32],
-    user_public_key: &[u8; 32],
-) -> Option<Vec<u8>> {
-    // Minimum size: some ciphertext + nonce(12) + tag(16)
-    if encrypted.len() < 29 {
-        return None;
-    }
-
-    let nonce_start = encrypted.len() - 28;
-    let tag_start = encrypted.len() - 16;
-
-    let ciphertext = &encrypted[..nonce_start];
-    let nonce_bytes = &encrypted[nonce_start..tag_start];
-    let tag = &encrypted[tag_start..];
-
-    // Perform X25519 ECDH
-    let tee_secret = StaticSecret::from(*tee_private_key);
-    let user_pubkey = X25519PublicKey::from(*user_public_key);
-    let shared_secret = tee_secret.diffie_hellman(&user_pubkey);
-
-    // Derive AES key
-    let aes_key = derive_aes_key(shared_secret.as_bytes());
-
-    // Initialize cipher
-    let cipher = Aes256Gcm::new_from_slice(&aes_key).ok()?;
-
-    // Reconstruct ciphertext+tag (aes-gcm expects them concatenated)
-    let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + 16);
-    ct_with_tag.extend_from_slice(ciphertext);
-    ct_with_tag.extend_from_slice(tag);
-
-    let nonce = Nonce::from_slice(nonce_bytes);
-    cipher.decrypt(nonce, ct_with_tag.as_ref()).ok()
-}
-
-/// Encrypt result back to user using their ephemeral public key
-fn encrypt_result_data(
-    plaintext: &[u8],
-    user_public_key: &[u8; 32],
-    tee_private_key: &[u8; 32],
-) -> Option<Vec<u8>> {
-    let tee_secret = StaticSecret::from(*tee_private_key);
-    let user_pubkey = X25519PublicKey::from(*user_public_key);
-    let shared_secret = tee_secret.diffie_hellman(&user_pubkey);
-
-    let aes_key = derive_aes_key(shared_secret.as_bytes());
-
-    let cipher = Aes256Gcm::new_from_slice(&aes_key).ok()?;
-
-    // Generate deterministic nonce from hash of plaintext (for reproducibility)
-    use sha2::Digest;
-    let mut hasher = Sha256::new();
-    hasher.update(plaintext);
-    let hash_result = hasher.finalize();
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(&hash_result[..12]);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    // Encrypt (returns ciphertext || tag)
-    let ciphertext_with_tag = cipher.encrypt(nonce, plaintext).ok()?;
-
-    // Build output: [ciphertext][nonce: 12][tag: 16]
-    let ct_len = ciphertext_with_tag.len() - 16;
-    let ciphertext = &ciphertext_with_tag[..ct_len];
-    let tag = &ciphertext_with_tag[ct_len..];
-
-    let mut result = Vec::with_capacity(ct_len + 28);
-    result.extend_from_slice(ciphertext);
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(tag);
-
-    Some(result)
-}
-
-/// Parse V2 predicate from decrypted bytes
-fn parse_predicate_v2(decrypted: &[u8]) -> Option<PredicateV2> {
-    if decrypted.len() < 2 {
-        return None;
-    }
-
-    let version = decrypted[0];
-    if version != 2 {
-        return None;
-    }
-
-    let filter_count = decrypted[1] as usize;
-    if filter_count > MAX_FILTERS {
-        return None;
-    }
-
-    let mut filters = [Filter::default(); MAX_FILTERS];
-
-    for i in 0..filter_count {
-        let offset = 2 + (i * FILTER_SIZE);
-        if offset + FILTER_SIZE > decrypted.len() {
-            return None;
-        }
-
-        filters[i] = Filter {
-            filter_type: decrypted[offset],
-            op: decrypted[offset + 1],
-            field: decrypted[offset + 2],
-            value: u64::from_le_bytes(decrypted[offset + 3..offset + 11].try_into().ok()?),
-        };
-    }
-
-    Some(PredicateV2 {
-        version,
-        filter_count: filter_count as u8,
-        filters,
-    })
-}
-
-/// Parse legacy V1 predicate (min_tvl, max_tvl) into V2 format
-fn parse_predicate_v1(decrypted: &[u8]) -> Option<PredicateV2> {
-    if decrypted.len() < 16 {
-        return None;
-    }
-
-    let min_tvl = u64::from_le_bytes(decrypted[0..8].try_into().ok()?);
-    let max_tvl = u64::from_le_bytes(decrypted[8..16].try_into().ok()?);
-
-    Some(PredicateV2 {
-        version: 1,
-        filter_count: 2,
-        filters: [
-            Filter {
-                filter_type: FilterType::Tvl as u8,
-                op: FilterOp::Gte as u8,
-                field: 0,
-                value: min_tvl,
-            },
-            Filter {
-                filter_type: FilterType::Tvl as u8,
-                op: FilterOp::Lte as u8,
-                field: 0,
-                value: max_tvl,
-            },
-            Filter::default(),
-            Filter::default(),
-        ],
-    })
-}
-
-/// Get field value from pool based on filter type
-/// Note: For token accounts, balance is stored in token_a_reserve
-fn get_pool_field_value(pool: &PoolData, filter_type: u8) -> u64 {
-    match filter_type {
-        0 => pool.tvl(),           // TVL (reserve_a + reserve_b)
-        1 => pool.token_a_reserve, // Balance (for token accounts)
-        6 => pool.token_a_reserve, // ReserveA
-        7 => pool.token_b_reserve, // ReserveB
-        8 => {
-            // Ratio (A/B * 1e9)
-            if pool.token_b_reserve > 0 {
-                (pool.token_a_reserve as u128 * 1_000_000_000 / pool.token_b_reserve as u128) as u64
-            } else {
-                u64::MAX
-            }
-        }
-        _ => 0, // Other filter types not supported
-    }
-}
-
-/// Evaluate a single pool against all filters (AND logic)
-fn evaluate_pool(pool: &PoolData, predicate: &PredicateV2) -> bool {
-    for i in 0..predicate.filter_count as usize {
-        let filter = &predicate.filters[i];
-        let pool_value = get_pool_field_value(pool, filter.filter_type);
-
-        let matches = match filter.op {
-            0 => pool_value >= filter.value, // GTE
-            1 => pool_value <= filter.value, // LTE
-            2 => pool_value == filter.value, // EQ
-            3 => pool_value != filter.value, // NEQ
-            _ => false,
-        };
-
-        if !matches {
-            return false;
-        }
-    }
-    true
-}
-
-// ============================================================================
-// PRIVATE EXECUTION (runs inside TEE)
-// ============================================================================
-
-/// Execute private query inside TEE enclave
-///
-/// Flow:
-/// 1. Decrypt predicate using X25519 ECDH + AES-256-GCM
-/// 2. Parse predicate (V1 or V2 format)
-/// 3. Evaluate pools against all filters
-/// 4. Encrypt results back to user
-fn execute_private_query(
-    encrypted_predicate: &[u8; ENCRYPTED_PREDICATE_SIZE],
-    decryption_key: &[u8; 32],
-    user_pubkey: &[u8; 32],
-    pools: &[PoolData],
-) -> ([u8; ENCRYPTED_RESULT_SIZE], u16, bool) {
-    // Step 1: Decrypt predicate
-    let decrypted = match decrypt_predicate(encrypted_predicate, decryption_key, user_pubkey) {
-        Some(d) => d,
-        None => {
-            // Fallback: treat as raw bytes for backward compatibility / testing
-            encrypted_predicate.to_vec()
-        }
-    };
-
-    // Step 2: Parse predicate (detect version)
-    let predicate = if !decrypted.is_empty() && decrypted[0] == 2 {
-        match parse_predicate_v2(&decrypted) {
-            Some(p) => p,
-            None => return ([0u8; ENCRYPTED_RESULT_SIZE], 0, false),
-        }
-    } else {
-        match parse_predicate_v1(&decrypted) {
-            Some(p) => p,
-            None => return ([0u8; ENCRYPTED_RESULT_SIZE], 0, false),
-        }
-    };
-
-    // Step 3: Evaluate pools against predicate
-    let mut matching_pools: Vec<Pubkey> = Vec::with_capacity(MAX_POOLS);
-
-    for pool in pools.iter() {
-        if evaluate_pool(pool, &predicate) {
-            matching_pools.push(pool.address);
-            if matching_pools.len() >= MAX_POOLS {
-                break;
-            }
-        }
-    }
-
-    // Step 4: Build and encrypt result
-    // Plaintext format: [match_count: u8][addresses: 32 * count]
-    let match_count = matching_pools.len() as u8;
-    let plaintext_len = 1 + (matching_pools.len() * 32);
-    let mut plaintext = vec![0u8; plaintext_len];
-
-    plaintext[0] = match_count;
-    for (i, pubkey) in matching_pools.iter().enumerate() {
-        let offset = 1 + i * 32;
-        plaintext[offset..offset + 32].copy_from_slice(pubkey.as_ref());
-    }
-
-    let encrypted_result_vec =
-        match encrypt_result_data(&plaintext, user_pubkey, decryption_key) {
-            Some(e) => e,
-            None => {
-                // Fallback: return plaintext with mock nonce/tag (for testing)
-                let mut fallback = plaintext.clone();
-                fallback.extend_from_slice(&[0xAB; 12]); // mock nonce
-                fallback.extend_from_slice(&[0xCD; 16]); // mock tag
-                fallback
-            }
-        };
-
-    let mut result = [0u8; ENCRYPTED_RESULT_SIZE];
-    let copy_len = encrypted_result_vec.len().min(ENCRYPTED_RESULT_SIZE);
-    result[..copy_len].copy_from_slice(&encrypted_result_vec[..copy_len]);
-
-    let actual_len = copy_len as u16;
-    (result, actual_len, true)
+#[event]
+pub struct BatchAnchored {
+    pub epoch: u64,
+    pub merkle_root: [u8; 32],
+    pub query_count: u64,
+    pub slot: u64,
 }

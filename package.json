@@ -17,6 +17,7 @@
     "@types/mocha": "^10.0.0",
     "@types/node": "^20.0.0",
     "chai": "^4.3.0",
+    "dotenv": "^17.2.4",
     "mocha": "^10.0.0",
     "ts-mocha": "^10.0.0",
     "tweetnacl": "^1.0.3",

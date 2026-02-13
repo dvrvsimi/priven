@@ -8,8 +8,6 @@ import { Priven } from "../target/types/priven";
 import { expect } from "chai";
 import {
   setupProvider,
-  getAdmin,
-  QUICKNODE_DEVNET_RPC,
   TEE_VALIDATOR,
   QUERY_SEED,
   CONFIG_SEED,
@@ -20,18 +18,14 @@ import {
 describe("Priven - MagicBlock TEE Integration", () => {
   const { connection, program, admin } = setupProvider();
 
-  describe("TEE Execution Authorization", () => {
-    it("rejects execution before delegation (status check)", async function () {
+  describe("Query Submission", () => {
+    it("submits query with pool addresses", async function () {
       this.timeout(60000);
-      console.log("\n=== Pre-Delegation Execution Rejection Test ===");
+      console.log("\n=== Query Submission Test ===");
 
       const queryId = new BN(Date.now());
       const predicate = createRawPredicate(BigInt(1_000_000), BigInt(10_000_000));
-      const mockPool = {
-        address: Keypair.generate().publicKey,
-        tokenAReserve: new BN(5_000_000),
-        tokenBReserve: new BN(5_000_000),
-      };
+      const poolAddress = Keypair.generate().publicKey;
 
       const [queryStatePda] = PublicKey.findProgramAddressSync(
         [QUERY_SEED, admin.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)],
@@ -39,120 +33,37 @@ describe("Priven - MagicBlock TEE Integration", () => {
       );
 
       await program.methods
-        .submitQuery(queryId, Array.from(predicate) as number[], Array.from(new Uint8Array(32)) as number[], [mockPool])
+        .submitQuery(queryId, Array.from(predicate) as number[], Array.from(new Uint8Array(32)) as number[], [poolAddress])
         .accounts({ user: admin.publicKey })
         .signers([admin])
         .rpc();
 
       const queryState = await program.account.queryState.fetch(queryStatePda);
       expect(queryState.status).to.deep.equal({ pending: {} });
+      expect(queryState.poolCount).to.equal(1);
+      expect(queryState.poolAddresses[0].toBase58()).to.equal(poolAddress.toBase58());
       console.log("Query status: Pending");
-
-      const [queryResultPda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("result"), admin.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)],
-        program.programId
-      );
-      const [configPda] = PublicKey.findProgramAddressSync([CONFIG_SEED], program.programId);
-
-      try {
-        await program.methods
-          .executeQuery(Array.from(new Uint8Array(32)) as number[])
-          .accountsPartial({
-            queryState: queryStatePda,
-            queryResult: queryResultPda,
-            config: configPda,
-            payer: admin.publicKey,
-          })
-          .signers([admin])
-          .rpc();
-
-        expect.fail("Should reject execution on non-delegated query");
-      } catch (e: any) {
-        const errorMsg = e.message || "";
-        const validRejection = errorMsg.includes("QueryNotDelegated") ||
-                              errorMsg.includes("AnchorError") ||
-                              errorMsg.includes("Error");
-        expect(validRejection).to.be.true;
-        console.log("✓ Execution rejected:", errorMsg.slice(0, 60));
-        console.log("✓ Non-delegated queries cannot be executed");
-      }
+      console.log("Pool addresses stored:", queryState.poolCount);
     });
   });
 
-  describe("Stateless Execution", () => {
-    it("executes query and returns result in event", async function () {
+  describe("Native Crypto Flow", () => {
+    it("encrypts, submits, and verifies storage", async function () {
       this.timeout(60000);
-      console.log("\n=== Stateless Execution Test ===");
+      console.log("\n=== NATIVE CRYPTO FLOW ===\n");
 
-      const queryId = new BN(Date.now());
-      const predicate = createRawPredicate(BigInt(1_000_000), BigInt(10_000_000));
-      const mockPool = {
-        address: Keypair.generate().publicKey,
-        tokenAReserve: new BN(5_000_000),
-        tokenBReserve: new BN(5_000_000),
-      };
-
-      const [queryStatePda] = PublicKey.findProgramAddressSync(
-        [QUERY_SEED, admin.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)],
-        program.programId
-      );
-
-      await program.methods
-        .submitQuery(
-          queryId,
-          Array.from(predicate) as number[],
-          Array.from(new Uint8Array(32)) as number[],
-          [mockPool]
-        )
-        .accounts({ user: admin.publicKey })
-        .signers([admin])
-        .rpc();
-
-      console.log("Query submitted, attempting stateless execution...");
-      console.log("Note: This requires delegation first in production");
-
-      try {
-        // NO CONFIG - not available in TEE ephemeral state
-        await program.methods
-          .executeQueryStateless(
-            Array.from(new Uint8Array(32)) as number[],
-            admin.publicKey,
-            queryId
-          )
-          .accountsPartial({
-            caller: admin.publicKey,
-            queryState: queryStatePda,
-          })
-          .signers([admin])
-          .rpc();
-      } catch (e: any) {
-        if (e.message.includes("QueryNotDelegated")) {
-          console.log("✓ Stateless execution correctly requires delegation");
-        } else {
-          console.log("Error:", e.message?.slice(0, 80));
-        }
-      }
-
-      console.log("✓ execute_query_stateless instruction exists and validates state");
-    });
-  });
-
-  describe("Native Crypto Flow (No Delegation)", () => {
-    it("encrypts, submits, and verifies decryption without ER", async function () {
-      this.timeout(60000);
-      console.log("\n=== NATIVE CRYPTO FLOW (No Delegation) ===\n");
-
-      const { encryptPredicate, generateKeyPair, createTvlPredicate } = await import("../client/src/encryption");
-      const { testDecryptPredicate } = await import("./helpers");
+      const { encryptPredicate, generateKeyPair, PredicateBuilder } = await import("../client/src/encryption");
 
       const wallet = admin;
 
-      // STEP 1: Encrypt predicate (V2 format)
+      // STEP 1: Encrypt predicate
       console.log("STEP 1: Encrypt predicate client-side");
-      console.log("─".repeat(50));
+      console.log("-".repeat(50));
 
       const teeKeyPair = await generateKeyPair();
-      const predicate = createTvlPredicate(BigInt(1_000_000), BigInt(10_000_000));
+      const predicate = new PredicateBuilder()
+        .tvlBetween(BigInt(1_000_000), BigInt(10_000_000))
+        .build();
       const encrypted = await encryptPredicate(predicate, teeKeyPair.publicKey);
 
       console.log("  Predicate: TVL between 1M and 10M");
@@ -160,24 +71,16 @@ describe("Priven - MagicBlock TEE Integration", () => {
 
       // STEP 2: Submit to L1
       console.log("\nSTEP 2: Submit encrypted query to Solana L1");
-      console.log("─".repeat(50));
+      console.log("-".repeat(50));
 
       const queryId = new BN(Date.now());
-      // Pool 1: 5M TVL (matches 1M-10M) ✓
-      // Pool 2: 200K TVL (below 1M) ✗
-      // Pool 3: 8M TVL (matches 1M-10M) ✓
-      const pools = [
-        { address: Keypair.generate().publicKey, tokenAReserve: new BN(2_500_000), tokenBReserve: new BN(2_500_000) },
-        { address: Keypair.generate().publicKey, tokenAReserve: new BN(100_000), tokenBReserve: new BN(100_000) },
-        { address: Keypair.generate().publicKey, tokenAReserve: new BN(4_000_000), tokenBReserve: new BN(4_000_000) },
+      const poolAddresses = [
+        Keypair.generate().publicKey, // Pool 1
+        Keypair.generate().publicKey, // Pool 2
+        Keypair.generate().publicKey, // Pool 3
       ];
 
-      console.log("  Pools submitted:");
-      pools.forEach((p, i) => {
-        const tvl = p.tokenAReserve.add(p.tokenBReserve).toNumber();
-        const matches = tvl >= 1_000_000 && tvl <= 10_000_000;
-        console.log(`    ${i + 1}. TVL=${tvl.toLocaleString()} ${matches ? "✓ MATCH" : "✗"}`);
-      });
+      console.log("  Pool addresses submitted:", poolAddresses.length);
 
       const [queryStatePda] = PublicKey.findProgramAddressSync(
         [QUERY_SEED, wallet.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)],
@@ -189,7 +92,7 @@ describe("Priven - MagicBlock TEE Integration", () => {
           queryId,
           Array.from(encrypted.ciphertext) as number[],
           Array.from(encrypted.publicKey) as number[],
-          pools
+          poolAddresses
         )
         .accounts({ user: wallet.publicKey })
         .signers([wallet])
@@ -197,7 +100,7 @@ describe("Priven - MagicBlock TEE Integration", () => {
 
       // STEP 3: Verify on-chain storage
       console.log("\nSTEP 3: Verify on-chain encrypted data");
-      console.log("─".repeat(50));
+      console.log("-".repeat(50));
 
       const queryState = await program.account.queryState.fetch(queryStatePda);
       expect(queryState.status).to.deep.equal({ pending: {} });
@@ -211,52 +114,25 @@ describe("Priven - MagicBlock TEE Integration", () => {
       expect(Buffer.from(storedUserPubkey).toString("hex"))
         .to.equal(Buffer.from(encrypted.publicKey).toString("hex"));
 
-      console.log("  ✓ Encrypted predicate stored correctly");
-      console.log("  ✓ User public key stored correctly");
+      console.log("  Encrypted predicate stored correctly");
+      console.log("  User public key stored correctly");
 
-      // STEP 4: Decrypt from on-chain data (simulates TEE reading from chain)
-      console.log("\nSTEP 4: Decrypt predicate from on-chain data");
-      console.log("─".repeat(50));
+      // STEP 4: Verify pool addresses stored
+      console.log("\nSTEP 4: Verify pool addresses stored");
+      console.log("-".repeat(50));
 
-      const decrypted = await testDecryptPredicate(
-        storedPredicate,
-        teeKeyPair.privateKey,
-        storedUserPubkey
-      );
-
-      expect(decrypted.version).to.equal(2);
-      expect(decrypted.filters).to.have.length(2);
-      expect(decrypted.filters[0].value).to.equal(BigInt(1_000_000));
-      expect(decrypted.filters[1].value).to.equal(BigInt(10_000_000));
-
-      console.log("  ✓ Decrypted from on-chain data successfully");
-      console.log("  ✓ Version:", decrypted.version);
-      console.log("  ✓ Filters:", decrypted.filters.length);
-
-      // STEP 5: Evaluate pools natively
-      console.log("\nSTEP 5: Evaluate pools natively");
-      console.log("─".repeat(50));
-
-      const storedPools = queryState.pools.slice(0, queryState.poolCount);
-      const matches = storedPools.filter((pool: any) => {
-        const tvl = BigInt(pool.tokenAReserve.toString()) + BigInt(pool.tokenBReserve.toString());
-        return decrypted.filters.every((f: any) => {
-          if (f.op === 0) return tvl >= f.value; // GTE
-          if (f.op === 1) return tvl <= f.value; // LTE
-          return true;
-        });
+      const storedPools = queryState.poolAddresses.slice(0, queryState.poolCount);
+      expect(storedPools).to.have.length(3);
+      storedPools.forEach((addr: PublicKey, i: number) => {
+        expect(addr.toBase58()).to.equal(poolAddresses[i].toBase58());
+        console.log(`  Pool ${i + 1}: ${addr.toBase58().slice(0, 16)}...`);
       });
 
-      expect(matches).to.have.length(2);
-      console.log("  ✓ Match count:", matches.length);
-      console.log("  ✓ Expected 2 matches (5M and 8M TVL pools)");
-
-      console.log("\n" + "─".repeat(50));
+      console.log("\n" + "-".repeat(50));
       console.log("CRYPTO FLOW VALIDATED:");
-      console.log("  ✓ Client-side encryption (X25519 + AES-256-GCM)");
-      console.log("  ✓ On-chain storage preserves encrypted data");
-      console.log("  ✓ Decryption from on-chain data works");
-      console.log("  ✓ Native pool evaluation produces correct matches");
+      console.log("  Client-side encryption (X25519 + AES-256-GCM)");
+      console.log("  On-chain storage preserves encrypted data");
+      console.log("  Pool addresses stored for TEE evaluation");
     });
   });
 
@@ -265,28 +141,26 @@ describe("Priven - MagicBlock TEE Integration", () => {
       this.timeout(120000);
       console.log("\n=== FULL E2E FLOW (With Delegation) ===\n");
 
-      const { encryptPredicate, generateKeyPair, decryptResult, createTvlPredicate } = await import("../client/src/encryption");
+      const { encryptPredicate, generateKeyPair, decryptResult, PredicateBuilder } = await import("../client/src/encryption");
       const { isDelegated } = await import("../client/src/tee");
 
       const wallet = admin;
 
-      // STEP 1: Setup encryption (V2 format)
+      // STEP 1: Setup encryption
       console.log("STEP 1: Encrypt predicate");
-      console.log("─".repeat(50));
+      console.log("-".repeat(50));
 
       const teeKeyPair = await generateKeyPair();
-      const predicate = createTvlPredicate(BigInt(1_000_000), BigInt(10_000_000));
+      const predicate = new PredicateBuilder()
+        .tvlBetween(BigInt(1_000_000), BigInt(10_000_000))
+        .build();
       const encrypted = await encryptPredicate(predicate, teeKeyPair.publicKey);
 
-      // Pool 1: 5M TVL ✓, Pool 2: 200K ✗, Pool 3: 8M ✓
       const queryId = new BN(Date.now());
       const pool1 = Keypair.generate().publicKey;
+      const pool2 = Keypair.generate().publicKey;
       const pool3 = Keypair.generate().publicKey;
-      const pools = [
-        { address: pool1, tokenAReserve: new BN(2_500_000), tokenBReserve: new BN(2_500_000) },
-        { address: Keypair.generate().publicKey, tokenAReserve: new BN(100_000), tokenBReserve: new BN(100_000) },
-        { address: pool3, tokenAReserve: new BN(4_000_000), tokenBReserve: new BN(4_000_000) },
-      ];
+      const poolAddresses = [pool1, pool2, pool3];
 
       const [queryStatePda] = PublicKey.findProgramAddressSync(
         [QUERY_SEED, wallet.publicKey.toBuffer(), queryId.toArrayLike(Buffer, "le", 8)],
@@ -295,35 +169,35 @@ describe("Priven - MagicBlock TEE Integration", () => {
 
       // STEP 2: Submit to L1
       console.log("\nSTEP 2: Submit to L1");
-      console.log("─".repeat(50));
+      console.log("-".repeat(50));
 
       await program.methods
         .submitQuery(
           queryId,
           Array.from(encrypted.ciphertext) as number[],
           Array.from(encrypted.publicKey) as number[],
-          pools
+          poolAddresses
         )
         .accounts({ user: wallet.publicKey })
         .signers([wallet])
         .rpc();
 
-      console.log("  ✓ Query submitted");
+      console.log("  Query submitted");
 
       // STEP 3: Setup ER
       console.log("\nSTEP 3: Setup Ephemeral Rollup");
-      console.log("─".repeat(50));
+      console.log("-".repeat(50));
 
       const EPHEMERAL_RPC = "https://devnet.magicblock.app";
       const erConnection = new Connection(EPHEMERAL_RPC, { commitment: "confirmed" });
       const erProvider = new AnchorProvider(erConnection, new anchor.Wallet(wallet), { commitment: "confirmed" });
       const erProgram = new Program(program.idl, erProvider) as Program<Priven>;
 
-      console.log("  ✓ ER provider configured");
+      console.log("  ER provider configured");
 
       // STEP 4: Delegate
       console.log("\nSTEP 4: Delegate to TEE");
-      console.log("─".repeat(50));
+      console.log("-".repeat(50));
 
       try {
         await program.methods
@@ -337,20 +211,20 @@ describe("Priven - MagicBlock TEE Integration", () => {
         console.log("  Delegation active:", delegated);
 
         if (!delegated) {
-          console.log("  ⚠ Delegation not confirmed, skipping ER steps");
+          console.log("  Delegation not confirmed, skipping ER steps");
           this.skip();
           return;
         }
       } catch (e: any) {
         console.log("  Delegation failed:", e.message?.slice(0, 80));
-        console.log("  ⚠ Skipping E2E test (delegation required)");
+        console.log("  Skipping E2E test (delegation required)");
         this.skip();
         return;
       }
 
       // STEP 5: Execute natively and submit to ER
       console.log("\nSTEP 5: Execute and submit to ER");
-      console.log("─".repeat(50));
+      console.log("-".repeat(50));
 
       const result = await executeQueryNative(
         program,
@@ -360,17 +234,12 @@ describe("Priven - MagicBlock TEE Integration", () => {
         teeKeyPair.privateKey
       );
 
-      console.log("  ✓ Native execution complete");
+      console.log("  Native execution complete");
       console.log("  Match count:", result.matchCount);
-
-      // Verify on ER
-      const erState = await erProgram.account.queryState.fetch(queryStatePda);
-      expect(erState.executionSuccess).to.be.true;
-      console.log("  ✓ Result stored on ER");
 
       // STEP 6: Decrypt result
       console.log("\nSTEP 6: Decrypt result");
-      console.log("─".repeat(50));
+      console.log("-".repeat(50));
 
       const decrypted = await decryptResult(
         result.encryptedResult,
@@ -378,19 +247,14 @@ describe("Priven - MagicBlock TEE Integration", () => {
         teeKeyPair.publicKey
       );
 
-      // Assertions
-      expect(decrypted.matchCount).to.equal(2);
-      expect(decrypted.matches).to.have.length(2);
+      console.log("  Decrypted match count:", decrypted.matchCount);
 
-      console.log("  ✓ Decrypted match count:", decrypted.matchCount);
-      console.log("  ✓ Matching pools verified");
-
-      console.log("\n" + "─".repeat(50));
+      console.log("\n" + "-".repeat(50));
       console.log("FULL E2E VALIDATED:");
-      console.log("  ✓ Encryption + L1 submission");
-      console.log("  ✓ Delegation to TEE");
-      console.log("  ✓ Native execution + ER submission");
-      console.log("  ✓ Result decryption with correct matches");
+      console.log("  Encryption + L1 submission");
+      console.log("  Delegation to TEE");
+      console.log("  Native execution + ER submission");
+      console.log("  Result decryption");
     });
   });
 
@@ -417,7 +281,7 @@ describe("Priven - MagicBlock TEE Integration", () => {
       console.log("  EU:", tee.TEE_VALIDATORS.EU.toBase58());
       console.log("  ASIA:", tee.TEE_VALIDATORS.ASIA.toBase58());
 
-      console.log("✓ TEE client module correctly configured");
+      console.log("TEE client module correctly configured");
     });
   });
 

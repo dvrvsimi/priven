@@ -3,7 +3,7 @@
  */
 import * as anchor from "@coral-xyz/anchor";
 import { BN } from "@coral-xyz/anchor";
-import { PublicKey, Keypair, Connection } from "@solana/web3.js";
+import { PublicKey, Keypair } from "@solana/web3.js";
 import { expect } from "chai";
 import {
   setupProvider,
@@ -64,11 +64,7 @@ describe("Priven - QuickNode Integration", () => {
         console.log("Predicate (SECRET): balance between", minBalance.toString(), "and", maxBalance.toString());
 
         const queryId = new BN(Date.now());
-        const selectedPools = nonZeroAccounts.map(a => ({
-          address: a.address,
-          tokenAReserve: new BN(a.balance.toString()),
-          tokenBReserve: new BN(0),
-        }));
+        const poolAddresses = nonZeroAccounts.map(a => a.address);
 
         const predicate = createRawPredicate(minBalance, maxBalance);
         const userPubkey = new Uint8Array(32);
@@ -80,7 +76,7 @@ describe("Priven - QuickNode Integration", () => {
             queryId,
             Array.from(predicate) as number[],
             Array.from(userPubkey) as number[],
-            selectedPools
+            poolAddresses
           )
           .accounts({ user: admin.publicKey })
           .signers([admin])
@@ -150,37 +146,6 @@ describe("Priven - QuickNode Integration", () => {
       expect(filter).to.include("MIN_CHANGE");
 
       console.log("\n✓ Streams filter function built successfully");
-    });
-  });
-
-  describe("Token module", () => {
-    it("fetches token accounts using tokens module", async function () {
-      this.timeout(60000);
-
-      console.log("\n=== SPL Token Fetching ===");
-
-      const { fetchTokenAccountsByOwner, toPoolData } = await import("../client/src/tokens");
-
-      const accounts = await fetchTokenAccountsByOwner(connection, admin.publicKey);
-
-      console.log(`Found ${accounts.length} token accounts via tokens module`);
-
-      if (accounts.length > 0) {
-        console.log("\nTop 5 by balance:");
-        const sorted = [...accounts].sort((a, b) => Number(b.balance - a.balance));
-        sorted.slice(0, 5).forEach((a, i) => {
-          console.log(`  ${i + 1}. mint=${a.mint.toBase58().slice(0, 12)}... balance=${a.balance}`);
-        });
-
-        const poolData = sorted.slice(0, 5).map(toPoolData);
-        console.log("\nConverted to PoolData format:");
-        poolData.forEach((p, i) => {
-          console.log(`  ${i + 1}. tokenAReserve=${p.tokenAReserve}`);
-        });
-      }
-
-      console.log("\n✓ Token fetching via QuickNode working");
-      expect(accounts.length).to.be.gte(0);
     });
   });
 

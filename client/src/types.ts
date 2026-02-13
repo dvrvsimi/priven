@@ -1,254 +1,197 @@
-import { PublicKey, Commitment } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 
 // ============================================================================
-// PREDICATE V2 TYPES (Flexible Filters)
+// QUERY TYPES
 // ============================================================================
 
-/**
- * Filter types for predicate evaluation (matches Rust FilterType enum)
- */
+/** Query type discriminator - determines how predicate is evaluated */
+export enum QueryType {
+  CPMM_POOLS = 0,       // Raydium CPMM pool queries
+  TOKEN_BALANCE = 1,    // Token balance threshold queries
+  TOKEN_OWNERSHIP = 2,  // Token holder queries
+  TX_LOOKUP = 3,        // Transaction/program interaction queries
+}
+
+// ============================================================================
+// FILTER TYPES
+// ============================================================================
+
+/** Filter types for predicate evaluation */
 export enum FilterType {
-  TVL = 0,
-  BALANCE = 1,
-  VOLUME_24H = 2,
-  FEE_RATE = 3,
-  PRICE = 4,
-  APY = 5,
-  RESERVE_A = 6,
-  RESERVE_B = 7,
-  RATIO = 8,
-  MINT = 9,
-  PROGRAM = 10,
-  SLOT_AGE = 11,
+  // CPMM Pool filters (0-15)
+  TOKEN_MINT_0 = 0,
+  TOKEN_MINT_1 = 1,
+  AMM_CONFIG = 2,
+  STATUS = 3,
+  RESERVE_0 = 4,
+  RESERVE_1 = 5,
+  TVL = 6,
+  LP_SUPPLY = 7,
+  OPEN_TIME = 8,
+
+  // Token filters (16-31)
+  TOKEN_MINT = 16,      // Token mint to query
+  MIN_BALANCE = 17,     // Minimum balance threshold
+  MAX_BALANCE = 18,     // Maximum balance threshold
+  HOLDER_COUNT = 19,    // For ownership queries
+
+  // Transaction filters (32-47)
+  WALLET_ADDRESS = 32,  // Wallet to check history for
+  PROGRAM_ID = 33,      // Program to check interaction with
+  AFTER_SLOT = 34,      // Only txs after this slot
+  BEFORE_SLOT = 35,     // Only txs before this slot
 }
 
-/**
- * Filter comparison operations (matches Rust FilterOp enum)
- */
+/** Filter comparison operations */
 export enum FilterOp {
-  GTE = 0, // >=
-  LTE = 1, // <=
-  EQ = 2, // ==
-  NEQ = 3, // !=
+  GTE = 0,
+  LTE = 1,
+  EQ = 2,
+  NEQ = 3,
 }
 
-/**
- * Single filter in V2 predicate (11 bytes when serialized)
- */
+/** Single filter in predicate */
 export interface Filter {
-  /** Filter type (what field to compare) */
   type: FilterType;
-
-  /** Comparison operation */
   op: FilterOp;
-
-  /** Reserved field for future use (default: 0) */
-  field?: number;
-
-  /** Value to compare against */
   value: bigint;
 }
 
-/**
- * Legacy V1 predicate - simple min/max TVL range
- * @deprecated Use PredicateV2 for more flexibility
- */
-export interface PredicateV1 {
-  /** Minimum TVL in lamports (token_a_reserve + token_b_reserve) */
-  minTvl: bigint;
-
-  /** Maximum TVL in lamports */
-  maxTvl: bigint;
-}
-
-/**
- * V2 predicate with flexible filters (max 4 filters)
- *
- * Serialized format: [version: u8][filter_count: u8][filters: Filter[]]
- * Each filter: [type: u8][op: u8][field: u8][value: u64] = 11 bytes
- * Total: 2 + (11 * 4) = 46 bytes plaintext -> 80 bytes encrypted
- */
-export interface PredicateV2 {
-  /** Version marker (always 2) */
-  version: 2;
-
-  /** Array of filters to apply (AND logic, max 4) */
+/** Predicate with flexible filters (max 4) */
+export interface Predicate {
+  queryType?: QueryType;  // Query type discriminator (default: CPMM_POOLS for backward compat)
   filters: Filter[];
 }
 
-/**
- * Union type for both predicate versions
- */
-export type Predicate = PredicateV1 | PredicateV2;
-
-/**
- * Type guard to check if predicate is V2
- */
-export function isPredicateV2(predicate: Predicate): predicate is PredicateV2 {
-  return "version" in predicate && predicate.version === 2;
-}
-
-/**
- * Type guard to check if predicate is V1 (legacy)
- */
-export function isPredicateV1(predicate: Predicate): predicate is PredicateV1 {
-  return "minTvl" in predicate && "maxTvl" in predicate && !("version" in predicate);
-}
-
-/** Encrypted predicate size for V1 (legacy): 16 bytes plaintext + 12 nonce + 16 tag = 44 bytes */
-export const ENCRYPTED_PREDICATE_SIZE_V1 = 44;
-
-/** Encrypted predicate size for V2: 46 bytes plaintext + padding + 12 nonce + 16 tag = 80 bytes */
+/** Encrypted predicate size: 80 bytes */
 export const ENCRYPTED_PREDICATE_SIZE = 80;
 
-/** Maximum filters in V2 predicate */
+/** Maximum filters in predicate */
 export const MAX_FILTERS = 4;
 
-/** Size of each filter when serialized */
-export const FILTER_SIZE = 11;
-
-/**
- * Encrypted predicate ready for submission to TEE
- */
+/** Encrypted predicate for TEE submission */
 export interface EncryptedPredicate {
-  /** Encrypted ciphertext - 80 bytes for V2 (padded plaintext + 12 nonce + 16 tag) */
   ciphertext: Uint8Array;
-
-  /** Ephemeral X25519 public key for encryption (32 bytes) */
   publicKey: Uint8Array;
-
-  /** User's ephemeral X25519 private key (PKCS8 format) for decryption */
   privateKey: Uint8Array;
 }
 
-/**
- * Pool data structure matching the on-chain PoolData
- */
-export interface PoolData {
-  /** Pool account address */
-  address: PublicKey;
-
-  /** Token A reserve amount in lamports */
-  tokenAReserve: bigint;
-
-  /** Token B reserve amount in lamports */
-  tokenBReserve: bigint;
-}
-
-/**
- * Decrypted query results from TEE
- */
+/** Decrypted query result from TEE */
 export interface QueryResult {
-  /** Array of matching pool addresses (up to 5 pools) */
   matches: PublicKey[];
-
-  /** Number of pools that matched the predicate */
   matchCount: number;
 }
 
-/**
- * Options for configuring query execution
- */
+/** Query execution options */
 export interface QueryOptions {
-  /** Mainnet RPC for fetching Raydium pools */
   mainnetRpc?: string;
-
-  /** Maximum number of pools to query (default: 5) */
   maxPools?: number;
-
-  /** Timeout in milliseconds for TEE execution (default: 30000) */
   timeout?: number;
-
-  /** Skip delegation step (if account is already delegated) */
   skipDelegation?: boolean;
 }
 
-/**
- * Filters for fetching Raydium pools from QuickNode
- */
-export interface PoolFilters {
-  /** Filter by pool status (1 = active) */
-  status?: number;
-
-  /** Filter by specific token mint address */
-  tokenMint?: PublicKey;
-
-  /** Minimum TVL to fetch (pre-filter before TEE) */
-  minTvlPrefilter?: bigint;
-}
-
-/**
- * Query state status values
- */
+/** Query state status */
 export enum QueryStatus {
-  /** Query created, not yet delegated */
   Pending = 0,
-  /** Delegated to TEE, waiting for execution */
   Delegated = 1,
-  /** TEE is processing */
-  Executing = 2,
-  /** Result committed to L1 */
-  Completed = 3,
-  /** Execution failed */
-  Failed = 4,
+  Completed = 2,
+  Failed = 3,
 }
 
-/**
- * On-chain QueryState account structure (for parsing)
- */
-export interface QueryStateAccount {
-  /** Owner wallet pubkey */
-  owner: PublicKey;
-  /** Unique query identifier */
-  queryId: bigint;
-  /** Encrypted predicate (80 bytes for V2, 44 bytes for V1 legacy) */
-  encryptedPredicate: Uint8Array;
-  /** User's ephemeral public key */
-  userPubkey: Uint8Array;
-  /** Query status */
-  status: QueryStatus;
-  /** Pool addresses to query */
-  poolAddresses: PublicKey[];
-  /** Number of valid pool addresses */
-  poolCount: number;
-  /** Timestamp when query was submitted */
-  submittedAt: bigint;
-  /** PDA bump */
-  bump: number;
-}
+// ============================================================================
+// ACCOUNT TYPES
+// ============================================================================
 
-/**
- * On-chain QueryResult account structure (for parsing)
- */
-export interface QueryResultAccount {
-  /** Owner wallet pubkey */
-  owner: PublicKey;
-  /** Query ID this result corresponds to */
-  queryId: bigint;
-  /** Encrypted result */
-  encryptedResult: Uint8Array;
-  /** Actual length of encrypted data */
-  encryptedLen: number;
-  /** Slot when result was committed */
-  completedSlot: bigint;
-  /** Whether execution succeeded */
-  success: boolean;
-  /** PDA bump */
-  bump: number;
-}
-
-/**
- * Program configuration account
- */
+/** QueryConfig account structure */
 export interface QueryConfigAccount {
-  /** Admin pubkey */
   admin: PublicKey;
-  /** TEE validator pubkey */
   teeValidator: PublicKey;
-  /** Maximum pools per query */
   maxPools: number;
-  /** Query fee in lamports */
   queryFee: bigint;
-  /** PDA bump */
+  totalQueries: bigint;
   bump: number;
+}
+
+/** QuerySession account structure */
+export interface QuerySessionAccount {
+  owner: PublicKey;
+  sessionId: bigint;
+  createdAt: bigint;
+  lastQueryAt: bigint;
+  queryCount: bigint;
+  bump: number;
+}
+
+/** QueryState account structure */
+export interface QueryStateAccount {
+  owner: PublicKey;
+  sessionId: bigint;
+  queryId: bigint;
+  encryptedPredicate: Uint8Array;
+  userPubkey: Uint8Array;
+  status: QueryStatus;
+  poolAddresses: PublicKey[];
+  poolCount: number;
+  submittedAt: bigint;
+  bump: number;
+}
+
+/** MerkleAnchor account structure */
+export interface MerkleAnchorAccount {
+  authority: PublicKey;
+  latestRoot: Uint8Array;
+  queryCount: bigint;
+  anchorSlot: bigint;
+  epoch: bigint;
+  bump: number;
+}
+
+// ============================================================================
+// EVENT TYPES
+// ============================================================================
+
+/** SessionOpened event */
+export interface SessionOpenedEvent {
+  sessionId: bigint;
+  owner: PublicKey;
+}
+
+/** SessionClosed event */
+export interface SessionClosedEvent {
+  sessionId: bigint;
+  owner: PublicKey;
+  queryCount: bigint;
+}
+
+/** QuerySubmitted event */
+export interface QuerySubmittedEvent {
+  sessionId: bigint;
+  queryId: bigint;
+  owner: PublicKey;
+  poolCount: number;
+}
+
+/** QueryExecuted event */
+export interface QueryExecutedEvent {
+  sessionId: bigint;
+  queryId: bigint;
+  owner: PublicKey;
+  success: boolean;
+  matchCount: number;
+  encryptedResult: Uint8Array;
+  resultHash: Uint8Array;
+}
+
+/** QueryClosed event */
+export interface QueryClosedEvent {
+  queryId: bigint;
+  owner: PublicKey;
+}
+
+/** BatchAnchored event */
+export interface BatchAnchoredEvent {
+  epoch: bigint;
+  merkleRoot: Uint8Array;
+  queryCount: bigint;
+  slot: bigint;
 }

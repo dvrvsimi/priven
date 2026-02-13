@@ -49,22 +49,20 @@ interface QueryOptions {
   timeout?: string;
   output?: OutputFormat;
   dryRun?: boolean;
+  local?: boolean;
 }
 
-// Filter type mapping (matches SDK FilterType enum)
+// Filter type mapping (matches SDK FilterType enum for CPMM)
 const FILTER_TYPES: Record<string, number> = {
-  tvl: 0,
-  balance: 1,
-  volume_24h: 2,
-  fee_rate: 3,
-  price: 4,
-  apy: 5,
-  reserve_a: 6,
-  reserve_b: 7,
-  ratio: 8,
-  mint: 9,
-  program: 10,
-  slot_age: 11,
+  token_mint_0: 0,
+  token_mint_1: 1,
+  amm_config: 2,
+  status: 3,
+  reserve_0: 4,
+  reserve_1: 5,
+  tvl: 6,
+  lp_supply: 7,
+  open_time: 8,
 };
 
 // Filter operation mapping (matches SDK FilterOp enum)
@@ -133,6 +131,7 @@ export function registerQueryCommand(program: Command): void {
     .option("--timeout <ms>", "TEE execution timeout in ms (default: 30000)")
     .option("--output <format>", "Output format: json or table", "table")
     .option("--dry-run", "Show what would be done without executing")
+    .option("--local", "Execute locally instead of waiting for TEE (development mode)")
     .action(async (options: QueryOptions) => {
       await executeQuery(options);
     });
@@ -210,7 +209,7 @@ async function executeQuery(options: QueryOptions): Promise<void> {
     console.log();
     console.log(chalk.bold("Priven Private Query"));
     console.log(chalk.gray("─".repeat(50)));
-    console.log(`  Pool Data:   ${chalk.cyan("mainnet")} (Raydium V4)`);
+    console.log(`  Pool Data:   ${chalk.cyan("mainnet")} (Raydium CPMM)`);
     console.log(`  Execution:   ${chalk.cyan("devnet")} (Priven program)`);
     console.log(`  Mainnet RPC: ${chalk.gray(maskRpcUrl(mainnetRpc))}`);
     console.log(`  Devnet RPC:  ${chalk.gray(maskRpcUrl(rpcUrl))}`);
@@ -299,7 +298,12 @@ async function executeQuery(options: QueryOptions): Promise<void> {
 
     // Execute the query
     console.log();
-    console.log(chalk.bold("Executing private query..."));
+    if (options.local) {
+      console.log(chalk.bold("Executing query locally (development mode)..."));
+      console.log(chalk.yellow("  Note: Results are mock - real evaluation happens in TEE"));
+    } else {
+      console.log(chalk.bold("Executing private query..."));
+    }
     console.log();
 
     // Build V2 predicate from parsed filters
@@ -312,11 +316,22 @@ async function executeQuery(options: QueryOptions): Promise<void> {
     const predicate = createPredicate(filters as any);
 
     try {
-      const matchingPools = await client.query(predicate, {
-        maxPools,
-        timeout,
-        mainnetRpc,
-      });
+      let matchingPools: PublicKey[];
+
+      if (options.local) {
+        // Local execution - simulates TEE for development
+        matchingPools = await client.queryLocal(predicate, {
+          maxPools,
+          mainnetRpc,
+        });
+      } else {
+        // Full TEE execution - waits for MagicBlock
+        matchingPools = await client.query(predicate, {
+          maxPools,
+          timeout,
+          mainnetRpc,
+        });
+      }
 
       console.log();
       outputSuccess("Query completed successfully");
@@ -338,10 +353,14 @@ async function executeQuery(options: QueryOptions): Promise<void> {
       // Provide helpful error messages
       if (error.message?.includes("Timeout")) {
         console.log(chalk.gray("\nTry increasing the timeout with --timeout <ms>"));
+        console.log(chalk.gray("Or use --local for local execution (development mode)"));
       } else if (error.message?.includes("No Raydium pools")) {
         console.log(chalk.gray("\nNo pools available. Check your RPC endpoint."));
       } else if (error.message?.includes("insufficient")) {
         console.log(chalk.gray("\nInsufficient SOL for transaction fees."));
+      } else if (error.message?.includes("UnauthorizedTeeValidator")) {
+        console.log(chalk.gray("\nFor --local mode, your wallet must be set as TEE validator."));
+        console.log(chalk.gray("Run: scripts/migrate-config.ts to set up config"));
       }
 
       process.exit(1);

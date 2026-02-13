@@ -1,51 +1,60 @@
 /**
- * Priven SDK - Privacy-Preserving Pool Queries on Solana
+ * Priven SDK - Privacy-Preserving RPC Layer for Solana
  *
- * Query Raydium liquidity pools privately using MagicBlock TEE
- * Powered by QuickNode RPC and MagicBlock's Private Ephemeral Rollups
+ * Query pools, token balances, ownership, and transaction history
+ * privately using MagicBlock TEE
  */
 
 // Main client
-export { PrivenClient, createPrivenClient, PRIVEN_PROGRAM_ID, PRIVEN_TEE_PROGRAM_ID } from "./client";
+export { PrivenClient, createPrivenClient, PRIVEN_PROGRAM_ID } from "./client";
+
+// Session-based API
+export { PrivenSession } from "./session";
+
+// @deprecated - use PRIVEN_PROGRAM_ID
+export { PRIVEN_TEE_PROGRAM_ID } from "./constants";
 
 // Types
 export type {
   Predicate,
-  PredicateV1,
-  PredicateV2,
   Filter,
   EncryptedPredicate,
-  PoolData,
   QueryResult,
   QueryOptions,
-  PoolFilters,
+  QueryStatus,
+  QueryStateAccount,
+  QuerySessionAccount,
+  QueryConfigAccount,
+  MerkleAnchorAccount,
+  QueryExecutedEvent,
+  QuerySubmittedEvent,
+  SessionOpenedEvent,
+  SessionClosedEvent,
+  BatchAnchoredEvent,
 } from "./types";
 
-// Type guards and enums
 export {
+  QueryType,
   FilterType,
   FilterOp,
-  isPredicateV1,
-  isPredicateV2,
   ENCRYPTED_PREDICATE_SIZE,
-  ENCRYPTED_PREDICATE_SIZE_V1,
   MAX_FILTERS,
-  FILTER_SIZE,
 } from "./types";
 
-// Encryption utilities
+// Encryption and query builders
 export {
   encryptPredicate,
   decryptResult,
   generateKeyPair,
-  createTvlPredicate,
   createPredicate,
   createFilter,
-  convertV1ToV2,
   PredicateBuilder,
+  createTokenBalanceQuery,
+  createTokenOwnershipQuery,
+  createTxLookupQuery,
 } from "./encryption";
 
-// TEE utilities
+// TEE
 export {
   createTeeSession,
   createTeeConnection,
@@ -62,26 +71,44 @@ export {
 } from "./tee";
 export type { TeeSession } from "./tee";
 
-// Pool fetching (QuickNode integration)
+// Pool discovery
 export {
-  fetchRaydiumPools,
-  fetchRaydiumPoolsWithRetry,
-  getMultiplePools,
-  calculateTVL,
-  RAYDIUM_V4_PROGRAM_ID,
-  RAYDIUM_POOL_SIZE,
+  discoverCpmmPools,
+  discoverCpmmPoolsWithRetry,
 } from "./pools";
+export type { CpmmDiscoveryOptions } from "./pools";
 
-// Token account fetching (works on devnet)
+// Token discovery
 export {
-  fetchTokenAccounts,
-  fetchTokenAccountsByOwner,
-  fetchTokenAccountsWithRetry,
-  toPoolData,
+  discoverTokenAccounts,
+  discoverTokenHolders,
+  getTokenBalance,
+  hasTokenBalance,
+  getHolderCount,
   TOKEN_PROGRAM_ID,
-  KNOWN_MINTS,
 } from "./tokens";
-export type { TokenAccountData, TokenFilters } from "./tokens";
+export type { TokenAccountInfo, TokenDiscoveryOptions } from "./tokens";
 
-// Re-export commonly used Solana types
+// Transaction lookup
+export {
+  getWalletTransactions,
+  hasInteractedWithProgram,
+  getInteractedPrograms,
+  hasRecentActivity,
+  getTransactionCount,
+} from "./transactions";
+export type { TransactionInfo, TxLookupOptions } from "./transactions";
+
+// Constants
+export {
+  RAYDIUM_CPMM_PROGRAM_ID,
+  CPMM_POOL_SIZE,
+  QUERY_SEED,
+  CONFIG_SEED,
+  SESSION_SEED,
+  ANCHOR_SEED,
+  getTeeEcdhPublicKey,
+} from "./constants";
+
+// Re-export Solana types
 export { PublicKey, Connection, Keypair } from "@solana/web3.js";

@@ -49,7 +49,7 @@ export const MAGIC_PROGRAM_ID = new PublicKey(
 // TEE VALIDATORS
 // ============================================================================
 
-/** TEE Validators (from MagicBlock docs) */
+/** TEE Validators - Solana identity keys (Ed25519) for on-chain verification */
 export const TEE_VALIDATORS = {
   /** Default TEE validator */
   TEE: new PublicKey(
@@ -62,6 +62,25 @@ export const TEE_VALIDATORS = {
   /** Asia region validator */
   ASIA: new PublicKey("MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57"),
 } as const;
+
+/**
+ * TEE ECDH Public Key (X25519) for encryption
+ *
+ * This is DIFFERENT from the validator identity key (Ed25519).
+ * X25519 is used for ECDH key exchange in AES-256-GCM encryption.
+ *
+ * In production, this should be the TEE's published X25519 public key.
+ * For testing, generate a keypair and set TEE_ECDH_PUBKEY_HEX env var.
+ */
+export function getTeeEcdhPublicKey(): Uint8Array {
+  const hexKey = process.env.TEE_ECDH_PUBKEY_HEX;
+  if (hexKey) {
+    return Uint8Array.from(Buffer.from(hexKey, "hex"));
+  }
+  // Fallback: Return zeros to indicate unconfigured (will fail encryption clearly)
+  console.warn("TEE_ECDH_PUBKEY_HEX not set - encryption will fail");
+  return new Uint8Array(32);
+}
 
 // ============================================================================
 // RPC ENDPOINTS
@@ -101,19 +120,16 @@ export const TOKEN_PROGRAM_ID_STRING =
   process.env.TOKEN_PROGRAM_ID || "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 // ============================================================================
-// RAYDIUM
+// RAYDIUM CPMM
 // ============================================================================
 
-/**
- * Raydium V4 AMM Program ID (Mainnet)
- * Devnet: HWy1jotHpo6UqeQxx49dpYYdQB8wj9Qk9MdxwjLvDHB8
- */
-export const RAYDIUM_V4_PROGRAM_ID = new PublicKey(
-  process.env.RAYDIUM_AMM_V4_PROGRAM_ID || "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+/** Raydium CPMM Program ID */
+export const RAYDIUM_CPMM_PROGRAM_ID = new PublicKey(
+  process.env.RAYDIUM_CPMM_PROGRAM_ID || "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
 );
 
-/** Raydium V4 pool account size (bytes) */
-export const RAYDIUM_POOL_SIZE = 752;
+/** CPMM PoolState account size (bytes) - verified on mainnet */
+export const CPMM_POOL_SIZE = 637;
 
 // ============================================================================
 // QUICKNODE STREAMS
@@ -135,11 +151,14 @@ export const QUICKNODE_WEBHOOK_URL = process.env.QUICKNODE_WEBHOOK_URL || "";
 /** Query state PDA seed */
 export const QUERY_SEED = Buffer.from("query");
 
-/** Query result PDA seed */
-export const RESULT_SEED = Buffer.from("result");
-
 /** Config PDA seed */
 export const CONFIG_SEED = Buffer.from("config");
+
+/** Session PDA seed */
+export const SESSION_SEED = Buffer.from("session");
+
+/** Merkle anchor PDA seed */
+export const ANCHOR_SEED = Buffer.from("anchor");
 
 // ============================================================================
 // NETWORK CONFIGURATION

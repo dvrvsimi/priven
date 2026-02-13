@@ -14,7 +14,7 @@ npm install -g @priven/cli
 # Initialize config
 priven config init
 
-# List Raydium pools
+# List Raydium CPMM pools (200k+ pools on mainnet)
 priven pools list --limit 10
 
 # Execute a private query
@@ -41,10 +41,13 @@ priven query --filter tvl:gte:1000000 --max-pools 10 --output json
 | Type | Description |
 |------|-------------|
 | `tvl` | Total Value Locked |
-| `balance` | Token balance |
-| `reserve_a` | Token A reserve |
-| `reserve_b` | Token B reserve |
-| `ratio` | Reserve ratio (basis points) |
+| `token_mint_0` | First token mint |
+| `token_mint_1` | Second token mint |
+| `reserve_0` | Token 0 reserve |
+| `reserve_1` | Token 1 reserve |
+| `lp_supply` | LP token supply |
+| `status` | Pool status |
+| `open_time` | Pool open time |
 
 | Op | Description |
 |----|-------------|
@@ -55,15 +58,39 @@ priven query --filter tvl:gte:1000000 --max-pools 10 --output json
 
 ### `priven pools`
 
-Discover Raydium V4 pools from mainnet.
+Discover Raydium CPMM pools from mainnet.
 
 ```bash
-priven pools list                    # List top pools by TVL
+priven pools list                    # List pools
 priven pools list --limit 50         # Show more pools
-priven pools list --min-tvl 10000000 # Filter by minimum TVL
 priven pools get <address>           # Get pool details
 priven pools stats                   # Show pool statistics
 ```
+
+### `priven session`
+
+Session management (optional - queries work without sessions).
+
+```bash
+priven session open                  # Open a new query session
+priven session list                  # List your active sessions
+priven session close <session-id>    # Close session, return rent
+priven session expire <session-id>   # Expire timed-out session
+```
+
+Sessions group queries for lifecycle management and stats tracking. They are optional - queries work without them using `session_id=0`.
+
+### `priven anchor`
+
+Merkle anchoring commands (TEE operator/admin).
+
+```bash
+priven anchor status                 # View current anchor state
+priven anchor init                   # Initialize anchor (admin only)
+priven anchor batch <root> <count>   # Post Merkle batch (operator)
+```
+
+Anchoring provides verifiable proof that queries were processed by the TEE. The TEE operator posts Merkle roots of query result hashes to L1.
 
 ### `priven tee`
 
