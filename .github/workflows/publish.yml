@@ -51,7 +51,7 @@ jobs:
             ## Installation
 
             ```bash
-            npm install @priven/client
+            npm install priven-sdk
             ```
 
             ## Changes
